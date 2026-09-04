@@ -13,43 +13,57 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Inspect vendored SecondString bytecode and provenance
+      - name: Verify exact vendored artifact and bytecode structure
         shell: bash
         run: |
           set -euo pipefail
           JAR=thirdParty/lib/secondstring.jar
-          echo '=== artifact ==='
-          ls -l "$JAR"
-          sha1sum "$JAR"
-          sha256sum "$JAR"
 
-          echo '=== Jaccard API ==='
-          javap -classpath "$JAR" -p com.wcohen.ss.Jaccard
-          echo '=== SimpleTokenizer API ==='
-          javap -classpath "$JAR" -p com.wcohen.ss.tokens.SimpleTokenizer
-          echo '=== Tokenizer API ==='
-          javap -classpath "$JAR" -p com.wcohen.ss.api.Tokenizer
+          test "$(stat -c%s "$JAR")" = "201564"
+          test "$(sha256sum "$JAR" | cut -d' ' -f1)" = "5267ae94cb2feff6b75bf112c1d22976b7835e04bad14b369cbd5525f20b520b"
 
-          echo '=== MongeElkan full declaration / bytecode ==='
-          javap -classpath "$JAR" -c -p com.wcohen.ss.MongeElkan | tee /tmp/monge.txt
-          echo '=== MongeElkan score method only ==='
-          sed -n '/public double score(/,/public java.lang.String explainScore/p' /tmp/monge.txt
-
-          echo '=== AffineGap declaration ==='
-          javap -classpath "$JAR" -p com.wcohen.ss.AffineGap
-          echo '=== AbstractStringDistance declaration ==='
-          javap -classpath "$JAR" -p com.wcohen.ss.AbstractStringDistance
-
-          echo '=== AffineGap MatrixTrio declaration / bytecode ==='
-          javap -classpath "$JAR" -c -p 'com.wcohen.ss.AffineGap$MatrixTrio'
-
-          echo '=== MongeElkan verbose metadata ==='
-          javap -classpath "$JAR" -verbose -p com.wcohen.ss.MongeElkan | grep -E 'major version|SourceFile|LineNumberTable|LocalVariableTable' || true
-          echo '=== MatrixTrio compute verbose method ==='
+          javap -classpath "$JAR" -c -p com.wcohen.ss.MongeElkan > /tmp/monge.txt
+          javap -classpath "$JAR" -c -p 'com.wcohen.ss.AffineGap$MatrixTrio' > /tmp/matrix.txt
           javap -classpath "$JAR" -verbose -p 'com.wcohen.ss.AffineGap$MatrixTrio' > /tmp/matrix-verbose.txt
+
+          echo '=== MongeElkan bytecode ==='
+          cat /tmp/monge.txt
+          echo '=== MatrixTrio bytecode ==='
+          cat /tmp/matrix.txt
+
+          # No Tokenizer field or descriptor anywhere in MongeElkan.
+          if grep -q 'com.wcohen.ss.api.Tokenizer' /tmp/monge.txt; then
+            echo 'Unexpected Tokenizer reference in MongeElkan' >&2
+            exit 1
+          fi
+
+          # Default constructor directly initializes AffineGap.
+          grep -F 'Method com/wcohen/ss/AffineGap."<init>":(Lcom/wcohen/ss/CharMatchScore;DDD)V' /tmp/monge.txt
+
+          # score() has the two mutually exclusive straight-line AffineGap call sites.
+          test "$(grep -c 'Method com/wcohen/ss/AffineGap.score:' /tmp/monge.txt)" -ge 2
+
+          # Exact assignment-expression bytecode and no later slot-1 load before return.
+          python3 - <<'PY'
+          import re
+          text = open('/tmp/matrix.txt', encoding='utf-8').read()
+          method = text.split('public double compute(int, int);', 1)[1]
+          method = method.split('\n}', 1)[0]
+          pattern = re.compile(r'72:\s+iconst_1\s+73:\s+dup\s+74:\s+istore_1\s+75:\s+iload_2', re.S)
+          assert pattern.search(method), 'expected iconst_1; dup; istore_1; iload_2 sequence not found'
+          tail = method.split('74: istore_1', 1)[1]
+          assert not re.search(r'\biload_1\b', tail), 'slot 1 is read again after clobber'
+          PY
+
+          echo '=== MatrixTrio verbose compute metadata ==='
           sed -n '/public double compute(int, int);/,/^}/p' /tmp/matrix-verbose.txt
 
-          cat > /tmp/TokenizerProbe.java <<'EOF'
+      - name: Execute exact-artifact runtime probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          JAR=thirdParty/lib/secondstring.jar
+          cat > /tmp/Probe.java <<'EOF'
           import com.wcohen.ss.Jaccard;
           import com.wcohen.ss.MongeElkan;
           import com.wcohen.ss.api.Tokenizer;
@@ -57,7 +71,7 @@ jobs:
           import java.lang.reflect.Field;
           import java.lang.reflect.Modifier;
 
-          public class TokenizerProbe {
+          public class Probe {
               private static Object tokenizerOf(Jaccard j) throws Exception {
                   Class<?> c = j.getClass();
                   while (c != null) {
@@ -69,50 +83,63 @@ jobs:
                       }
                       c = c.getSuperclass();
                   }
-                  throw new IllegalStateException("Tokenizer field not found");
+                  throw new AssertionError("Tokenizer field not found in Jaccard hierarchy");
               }
 
-              private static void printTokenizerFields(Class<?> start) {
+              private static int tokenizerFieldCount(Class<?> start) {
                   int count = 0;
-                  Class<?> c = start;
-                  while (c != null) {
+                  for (Class<?> c = start; c != null; c = c.getSuperclass()) {
                       for (Field f : c.getDeclaredFields()) {
-                          if (Tokenizer.class.isAssignableFrom(f.getType())) {
-                              count++;
-                              System.out.println("tokenizer-field-in-hierarchy=" + c.getName() + "." + f.getName());
-                          }
+                          if (Tokenizer.class.isAssignableFrom(f.getType())) count++;
                       }
-                      c = c.getSuperclass();
                   }
-                  System.out.println("tokenizer-field-count-in-hierarchy=" + count);
+                  return count;
+              }
+
+              private static void require(boolean condition, String message) {
+                  if (!condition) throw new AssertionError(message);
+              }
+
+              private static void score(MongeElkan scorer, String a, String b) {
+                  double value = scorer.score(a, b);
+                  System.out.println("score aLen=" + a.length() + " bLen=" + b.length()
+                      + " aWhitespace=" + a.trim().isEmpty()
+                      + " bWhitespace=" + b.trim().isEmpty()
+                      + " value=" + Double.toString(value)
+                      + " rawBits=0x" + Long.toHexString(Double.doubleToRawLongBits(value)));
               }
 
               public static void main(String[] args) throws Exception {
                   Jaccard a = new Jaccard();
                   Jaccard b = new Jaccard();
-                  Object ta = tokenizerOf(a);
-                  Object tb = tokenizerOf(b);
-                  System.out.println("default-tokenizer-shared=" + (ta == tb));
-                  System.out.println("default-tokenizer-class=" + ta.getClass().getName());
+                  require(tokenizerOf(a) == tokenizerOf(b), "default Jaccard tokenizers are not shared");
 
                   Jaccard c = new Jaccard(new SimpleTokenizer(true, true));
                   Jaccard d = new Jaccard(new SimpleTokenizer(true, true));
-                  Object tc = tokenizerOf(c);
-                  Object td = tokenizerOf(d);
-                  System.out.println("custom-tokenizer-distinct=" + (tc != td));
+                  require(tokenizerOf(c) != tokenizerOf(d), "custom Jaccard tokenizers unexpectedly share identity");
+                  require(tokenizerFieldCount(MongeElkan.class) == 0, "MongeElkan hierarchy unexpectedly contains Tokenizer state");
 
-                  printTokenizerFields(MongeElkan.class);
+                  Field nextId = SimpleTokenizer.class.getDeclaredField("nextId");
+                  Field tokMap = SimpleTokenizer.class.getDeclaredField("tokMap");
+                  require(!Modifier.isStatic(nextId.getModifiers()), "nextId unexpectedly static");
+                  require(!Modifier.isStatic(tokMap.getModifiers()), "tokMap unexpectedly static");
+                  require(!Modifier.isSynchronized(SimpleTokenizer.class.getDeclaredMethod("intern", String.class).getModifiers()), "intern unexpectedly synchronized");
+                  require(!Modifier.isSynchronized(SimpleTokenizer.class.getDeclaredMethod("tokenize", String.class).getModifiers()), "tokenize unexpectedly synchronized");
 
-                  for (Field f : SimpleTokenizer.class.getDeclaredFields()) {
-                      System.out.println("simple-tokenizer-field=" + Modifier.toString(f.getModifiers()) + " " + f.getType().getName() + " " + f.getName());
-                  }
-                  for (java.lang.reflect.Method m : SimpleTokenizer.class.getDeclaredMethods()) {
-                      if (m.getName().equals("intern") || m.getName().equals("tokenize")) {
-                          System.out.println("simple-tokenizer-method=" + Modifier.toString(m.getModifiers()) + " " + m.toGenericString());
-                      }
-                  }
+                  System.out.println("tokenizer-identity-and-modifier-assertions=PASS");
+
+                  MongeElkan scorer = new MongeElkan();
+                  score(scorer, "", "");
+                  score(scorer, "", "abc");
+                  score(scorer, "abc", "");
+                  score(scorer, "   ", "   ");
+                  score(scorer, "   ", " ");
+                  score(scorer, "   ", "");
+                  score(scorer, "", "   ");
               }
           }
           EOF
-          javac -classpath "$JAR" /tmp/TokenizerProbe.java
-          java -classpath "$JAR:/tmp" TokenizerProbe
+
+          javac -classpath "$JAR" /tmp/Probe.java
+          java -classpath "$JAR:/tmp" Probe | tee /tmp/probe-output.txt
+          grep -F 'tokenizer-identity-and-modifier-assertions=PASS' /tmp/probe-output.txt
