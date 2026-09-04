@@ -1,0 +1,27 @@
+name: SecondString bytecode inspection
+
+on:
+  push:
+    branches:
+      - analysis/secondstring-bytecode
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect vendored SecondString bytecode
+        shell: bash
+        run: |
+          set -euo pipefail
+          JAR=thirdParty/lib/secondstring.jar
+          echo '=== artifact ==='
+          ls -l "$JAR"
+          sha1sum "$JAR"
+          echo '=== MongeElkan declaration / bytecode ==='
+          javap -classpath "$JAR" -c -p com.wcohen.ss.MongeElkan
+          echo '=== AffineGap MatrixTrio declaration / bytecode ==='
+          javap -classpath "$JAR" -c -p 'com.wcohen.ss.AffineGap$MatrixTrio'
