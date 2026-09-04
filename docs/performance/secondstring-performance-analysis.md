@@ -17,7 +17,7 @@ No production-wide speedup ranking is claimed until allocation and CPU profiles 
 1. **Correctness and resource-safety come first, with compatibility baselines before fixes.** Spark UDF registration can alias TEXT and NUMERIC Jaccard under the same name, changing which scorer actually runs. Fixing that changes feature values for affected models, so it is a compatibility-affecting correctness fix, not a performance-neutral cleanup.
 2. **SecondString's default Jaccard tokenizer defeats Spark task isolation.** `SimpleTokenizer.DEFAULT_TOKENIZER` is static, mutable, unbounded, and backed by an unsynchronized `TreeMap`. Every distinct token is retained for the process/classloader lifetime. The safest first mitigation is not a Jaccard rewrite: pass a fresh `SimpleTokenizer(true, true)` into each `SJacc` instance, preserving the same tokenizer/scoring algorithm while removing process-wide singleton state.
 3. **Baseline score vectors belong before either correctness fix or tokenizer replacement.** Differential vectors against the exact bundled JAR, UDF-alias reproduction, and deterministic tokenizer-identity/state assertions belong in the first PR. JFR/JMH attribution is a separate later step.
-4. **The shipped JAR bytecode confirms the FUZZY AffineGap path and the historical `i=1` anomaly.** `MongeElkan` in the bundled artifact extends `AffineGap` and invokes `AffineGap.score`; `AffineGap$MatrixTrio.compute` contains the `iconst_1` / `istore` sequence corresponding to the source expression `i=1` before the `InsertTMatrix.get` lookup. These are properties of the artifact Zingg ships, not merely current upstream source.
+4. **The exact shipped artifact is now fingerprinted and its load-bearing bytecode is verified.** The bundled JAR is 201,564 bytes with SHA-256 `5267ae94cb2feff6b75bf112c1d22976b7835e04bad14b369cbd5525f20b520b`. Its `MongeElkan` extends and invokes `AffineGap`, and `AffineGap$MatrixTrio.compute` contains the `iconst_1` / `istore_1` sequence corresponding to the historical source expression `i=1` before the `InsertTMatrix.get` lookup.
 5. **AffineGap remains a high-confidence per-call memory target.** Three memo matrices allocate `double[][]` and `boolean[][]` storage. A score-only rolling-row implementation can reduce working storage from O(m*n) to O(min(m,n)), but end-to-end priority still depends on profiling.
 6. **Explicit Vector API implementation is deferred under the current Java 11 build, but SIMD-readiness is now a design constraint.** The Spark 4 / Java 17+ transition is the natural boundary for an optional vector backend. Scalar rewrites should therefore use flat primitive storage, simple loops, and narrow kernels that can later gain a vector implementation without another architecture rewrite.
 7. **Spark's per-feature Java UDF boundary is itself an optimization surface.** FUZZY currently evaluates AffineGap and Jaro as separate UDFs over the same pair of strings, repeating conversion and generic Java-UDF overhead.
@@ -38,31 +38,40 @@ under the synthetic Maven coordinate:
 com.wcohen.ss:secondstring:2021
 ```
 
-The repository blob is 201,564 bytes and has Git blob SHA:
+The exact vendored artifact is now fingerprinted as:
 
 ```text
-92ddf6c9a48e010e9bf4e748956bf52c89a67b9b
+byte size:  201564
+SHA-256:    5267ae94cb2feff6b75bf112c1d22976b7835e04bad14b369cbd5525f20b520b
+SHA-1:      32ca06dc0c0ceba2efbd3de90dce513455d9cc66
+Git blob:   92ddf6c9a48e010e9bf4e748956bf52c89a67b9b
 ```
 
-That Git SHA is useful for repository identity, but it is **not** a portable file checksum because Git hashes its own `blob <length>\0` framing together with the content. The portable artifact fingerprint must be the raw JAR's **SHA-256**.
+The Git blob SHA remains useful as a repository locator only. It is **not** interchangeable with a portable file checksum because Git hashes its own `blob <length>\0` framing together with the content. The SHA-256 above is the portable artifact fingerprint that can be compared with an independently obtained JAR.
 
-A dedicated exact-artifact inspection should therefore record together:
+Exact-artifact `javap -verbose` inspection reports class-file major version **52** for both `MongeElkan` and `AffineGap$MatrixTrio`, meaning the classes target the Java 8 class-file format. That does not identify the exact compiler or JDK version that produced the JAR. `SourceFile`, `LineNumberTable`, and `LocalVariableTable` attributes are present, so normal source/line/local-variable debug metadata survived in these classes.
 
-- raw JAR SHA-256;
-- byte size;
-- Git blob SHA, as a repository locator only;
-- class-file major version;
-- whether `SourceFile`, `LineNumberTable`, and `LocalVariableTable` metadata survived;
-- selected `javap -c -p` output for the load-bearing classes.
+The JAR was added in Zingg's initial repository import on 2021-08-25 and has not subsequently changed. Source history strongly resembles the June-2012 SecondString lineage, but file size similarity is not provenance proof and is no longer used to resolve runtime behavior. The SHA-256 can now be used for an actual byte-for-byte comparison if the historical distribution is obtained independently.
 
-The JAR was added in Zingg's initial repository import on 2021-08-25 and has not subsequently changed. Source history strongly resembles the June-2012 SecondString lineage, but file size similarity is not provenance proof and is no longer used to resolve runtime behavior.
+### Reproducible exact-artifact checks
+
+The provenance/bytecode inspection is mechanically reproducible from the repository checkout:
+
+```bash
+sha256sum thirdParty/lib/secondstring.jar
+javap -classpath thirdParty/lib/secondstring.jar -p com.wcohen.ss.Jaccard
+javap -classpath thirdParty/lib/secondstring.jar -c -p com.wcohen.ss.MongeElkan
+javap -classpath thirdParty/lib/secondstring.jar -c -p 'com.wcohen.ss.AffineGap$MatrixTrio'
+javap -classpath thirdParty/lib/secondstring.jar -verbose -p com.wcohen.ss.MongeElkan
+javap -classpath thirdParty/lib/secondstring.jar -verbose -p 'com.wcohen.ss.AffineGap$MatrixTrio'
+```
 
 ### Confirmed from the vendored bytecode
 
 The exact bundled JAR establishes both previously open questions:
 
-- `com.wcohen.ss.MongeElkan` is a subclass of `com.wcohen.ss.AffineGap` and calls the inherited AffineGap scoring path.
-- `com.wcohen.ss.AffineGap$MatrixTrio.compute` contains the bytecode pattern generated by the source assignment `i=1`: an `iconst_1` followed by storing that value into the local corresponding to `i` before the value is used for the `InsertTMatrix.get` lookup.
+- `com.wcohen.ss.MongeElkan` is a subclass of `com.wcohen.ss.AffineGap` and invokes `AffineGap.score(StringWrapper, StringWrapper)` in both scaling and non-scaling branches.
+- `com.wcohen.ss.AffineGap$MatrixTrio.compute` contains the sequence `iconst_1; dup; istore_1` immediately before loading `j - 1` and invoking `InsertTMatrix.get(int, int)`. This is the bytecode signature expected from assigning `i = 1` in that argument expression, not from computing `i - 1`.
 
 The recurrence anomaly is therefore present in the binary Zingg actually executes. Any optimized replacement must make an explicit compatibility decision rather than assuming the mathematically expected `i-1` behavior.
 
@@ -144,6 +153,18 @@ private Map tokMap = new TreeMap();
 
 Every unseen token is interned into that map and never removed.
 
+### Exact-artifact structural probe
+
+The vendored binary exposes `Jaccard(Tokenizer)` and `Jaccard()` exactly as expected. A reflection/API probe against the shipped JAR produced:
+
+```text
+default-tokenizer-shared=true
+default-tokenizer-class=com.wcohen.ss.tokens.SimpleTokenizer
+custom-tokenizer-distinct=true
+```
+
+The same probe confirms `SimpleTokenizer` contains the mutable instance fields `nextId` and `tokMap`; `intern(String)` and `tokenize(String)` are ordinary public methods with no `synchronized` modifier. This deterministic structure is the primary concurrency/resource-safety evidence. A race stress test is only corroboration.
+
 ### Structural consequences
 
 1. Retained memory grows with all distinct tokens seen by the JVM/classloader, rather than the working set of one comparison or one task.
@@ -157,7 +178,7 @@ Spark executors run tasks on a thread pool. Spark 3.5.5 deserializes a separate 
 
 The static `SimpleTokenizer.DEFAULT_TOKENIZER` bypasses that ownership boundary: independently deserialized `SJacc`/`Jaccard` instances reconnect to the same classloader-global tokenizer object inside the executor JVM.
 
-This substantially strengthens the safe intermediate mitigation below: a tokenizer held as ordinary instance state should remain isolated with the task/UDF instance rather than shared by the static singleton. The baseline suite should still assert this identity behavior directly under Zingg's Spark execution path so that the assumption is regression-tested rather than left implicit.
+This substantially strengthens the safe intermediate mitigation below: a tokenizer held as ordinary instance state should remain isolated with the task/UDF instance rather than shared by the static singleton. PR A should still assert this identity behavior directly under Zingg's Spark execution path so that task-level ownership is regression-tested in the actual integration, not inferred only from generic Spark executor mechanics.
 
 ### Tests: deterministic evidence first, stress only as corroboration
 
@@ -166,7 +187,8 @@ A concurrency stress test must **not** be a pass/fail proof that the current imp
 The baseline should contain deterministic structural assertions that always hold for the current artifact:
 
 - two default `Jaccard`/`SJacc` instances resolve to the same tokenizer object by identity;
-- the tokenizer's interning state is mutable instance state on that singleton;
+- two `Jaccard` instances constructed with separate `new SimpleTokenizer(true, true)` arguments resolve to distinct tokenizer objects;
+- the tokenizer's interning state is mutable instance state on the default singleton;
 - its relevant mutation methods/fields are not synchronized;
 - task-deserialized scorer instances in the Zingg/Spark path are distinct, while the default tokenizer identity is still shared because it is static.
 
@@ -183,7 +205,7 @@ Absence of those signatures in one run is not evidence of safety.
 
 ## 5. Safer intermediate Jaccard fix: isolate the existing tokenizer before rewriting it
 
-SecondString exposes `Jaccard(Tokenizer)`. Therefore removing process-wide tokenizer retention does **not** require rewriting the Jaccard algorithm or tokenizer semantics.
+The bundled SecondString binary exposes `Jaccard(Tokenizer)`, so removing process-wide tokenizer retention does **not** require rewriting the Jaccard algorithm or tokenizer semantics. The exact-artifact probe also confirms that separately supplied `SimpleTokenizer(true, true)` instances remain distinct rather than being canonicalized back to the default singleton.
 
 A minimal Zingg-side change can make `SJacc` construct the same tokenizer configuration explicitly:
 
@@ -192,8 +214,6 @@ public SJacc() {
     super(new SimpleTokenizer(true, true));
 }
 ```
-
-The exact constructor/API is pinned against the bundled binary in the baseline suite before this lands.
 
 ### Why this is the preferred first change
 
@@ -353,14 +373,13 @@ They are independent allocation cleanups, not higher priority than the shared to
 
 ### A. Correctness/provenance baseline — before behavior or tokenizer-state changes
 
-Capture and commit:
+The report has already pinned the raw bundled-JAR SHA-256, byte size, Git blob locator, Java-8 class-file target, surviving debug attributes, exact `MongeElkan -> AffineGap` bytecode path, exact `i=1` bytecode signature, default-tokenizer identity sharing, and distinct identity for separately supplied tokenizers.
 
-- raw bundled-JAR SHA-256, byte size, and Git blob locator;
-- class-file major version and surviving debug attributes;
-- `javap` evidence for `MongeElkan -> AffineGap` and the `i=1` bytecode sequence;
+PR A should turn the remaining compatibility assumptions into executable regression evidence:
+
 - differential score vectors against the bundled JAR for Jaccard, Jaro, and Monge-Elkan/AffineGap;
 - UDF alias reproduction in both TEXT/NUMERIC field orders;
-- deterministic tokenizer identity/mutability/synchronization assertions;
+- deterministic tokenizer identity/mutability/synchronization assertions using the exact vendored artifact;
 - task/UDF instance-identity assertions showing static tokenizer sharing across otherwise distinct task scorer instances;
 - a non-gating concurrency stress test that records corruption signatures when observed.
 
@@ -386,7 +405,7 @@ Add JMH/focused microbenchmarks for scorer-level throughput and bytes/op over mu
 
 ### PR A — evidence and compatibility baselines
 
-- exact bundled-artifact SHA-256 and bytecode metadata;
+- commit the exact-artifact provenance/bytecode checks already established above;
 - score differential vectors against the bundled JAR;
 - TEXT + NUMERIC UDF-alias reproduction and pinned current/intended outputs;
 - deterministic tokenizer-sharing/unsynchronized-state assertions;
@@ -468,6 +487,6 @@ This is not an immediate implementation PR. The earlier scalar PRs should be SIM
 
 ## Bottom line
 
-The roadmap is now compatibility-first rather than optimization-first. Pin the shipped artifact and current scores, reproduce the UDF alias, and make tokenizer sharing/task ownership deterministic facts. Then fix the UDF alias with explicit model-compatibility messaging and remove process-wide Jaccard tokenizer state through the smallest semantics-preserving constructor change before considering a custom tokenizer/Jaccard implementation.
+The roadmap is now compatibility-first rather than optimization-first. The shipped artifact is fingerprinted, its load-bearing bytecode is pinned, and default-vs-explicit tokenizer identity behavior is directly observed. PR A should now convert the remaining score and Spark-integration assumptions into executable baselines before behavior changes land.
 
-After those safety fixes, JFR/JMH decides whether the next largest gain is rolling AffineGap, Jaro allocation reduction, primitive Jaccard, or Spark-UDF fusion. All scalar hot kernels should be written in SIMD-friendly primitive form so the upcoming Spark 4 / Java 17+ build can add an optional Vector API backend without rearchitecting them, but explicit Vector API code should wait for that build boundary and measured benefit.
+Then fix the UDF alias with explicit model-compatibility messaging and remove process-wide Jaccard tokenizer state through the smallest semantics-preserving constructor change before considering a custom tokenizer/Jaccard implementation. After those safety fixes, JFR/JMH decides whether the next largest gain is rolling AffineGap, Jaro allocation reduction, primitive Jaccard, or Spark-UDF fusion. All scalar hot kernels should be written in SIMD-friendly primitive form so the upcoming Spark 4 / Java 17+ build can add an optional Vector API backend without rearchitecting them, but explicit Vector API code should wait for that build boundary and measured benefit.
