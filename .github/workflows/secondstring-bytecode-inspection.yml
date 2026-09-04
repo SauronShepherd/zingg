@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Inspect vendored SecondString bytecode
+      - name: Inspect vendored SecondString bytecode and provenance
         shell: bash
         run: |
           set -euo pipefail
@@ -21,7 +21,71 @@ jobs:
           echo '=== artifact ==='
           ls -l "$JAR"
           sha1sum "$JAR"
+          sha256sum "$JAR"
+
+          echo '=== Jaccard API ==='
+          javap -classpath "$JAR" -p com.wcohen.ss.Jaccard
+          echo '=== SimpleTokenizer API ==='
+          javap -classpath "$JAR" -p com.wcohen.ss.tokens.SimpleTokenizer
+          echo '=== Tokenizer API ==='
+          javap -classpath "$JAR" -p com.wcohen.ss.api.Tokenizer
+
           echo '=== MongeElkan declaration / bytecode ==='
           javap -classpath "$JAR" -c -p com.wcohen.ss.MongeElkan
           echo '=== AffineGap MatrixTrio declaration / bytecode ==='
           javap -classpath "$JAR" -c -p 'com.wcohen.ss.AffineGap$MatrixTrio'
+
+          echo '=== MongeElkan verbose metadata ==='
+          javap -classpath "$JAR" -verbose -p com.wcohen.ss.MongeElkan | grep -E 'major version|SourceFile|LineNumberTable|LocalVariableTable' || true
+          echo '=== MatrixTrio verbose metadata ==='
+          javap -classpath "$JAR" -verbose -p 'com.wcohen.ss.AffineGap$MatrixTrio' | grep -E 'major version|SourceFile|LineNumberTable|LocalVariableTable' || true
+
+          cat > /tmp/TokenizerProbe.java <<'EOF'
+          import com.wcohen.ss.Jaccard;
+          import com.wcohen.ss.api.Tokenizer;
+          import com.wcohen.ss.tokens.SimpleTokenizer;
+          import java.lang.reflect.Field;
+          import java.lang.reflect.Modifier;
+
+          public class TokenizerProbe {
+              private static Object tokenizerOf(Jaccard j) throws Exception {
+                  Class<?> c = j.getClass();
+                  while (c != null) {
+                      for (Field f : c.getDeclaredFields()) {
+                          if (Tokenizer.class.isAssignableFrom(f.getType())) {
+                              f.setAccessible(true);
+                              return f.get(j);
+                          }
+                      }
+                      c = c.getSuperclass();
+                  }
+                  throw new IllegalStateException("Tokenizer field not found");
+              }
+
+              public static void main(String[] args) throws Exception {
+                  Jaccard a = new Jaccard();
+                  Jaccard b = new Jaccard();
+                  Object ta = tokenizerOf(a);
+                  Object tb = tokenizerOf(b);
+                  System.out.println("default-tokenizer-shared=" + (ta == tb));
+                  System.out.println("default-tokenizer-class=" + ta.getClass().getName());
+
+                  Jaccard c = new Jaccard(new SimpleTokenizer(true, true));
+                  Jaccard d = new Jaccard(new SimpleTokenizer(true, true));
+                  Object tc = tokenizerOf(c);
+                  Object td = tokenizerOf(d);
+                  System.out.println("custom-tokenizer-distinct=" + (tc != td));
+
+                  for (Field f : SimpleTokenizer.class.getDeclaredFields()) {
+                      System.out.println("simple-tokenizer-field=" + Modifier.toString(f.getModifiers()) + " " + f.getType().getName() + " " + f.getName());
+                  }
+                  for (java.lang.reflect.Method m : SimpleTokenizer.class.getDeclaredMethods()) {
+                      if (m.getName().equals("intern") || m.getName().equals("tokenize")) {
+                          System.out.println("simple-tokenizer-method=" + Modifier.toString(m.getModifiers()) + " " + m.toGenericString());
+                      }
+                  }
+              }
+          }
+          EOF
+          javac -classpath "$JAR" /tmp/TokenizerProbe.java
+          java -classpath "$JAR:/tmp" TokenizerProbe
