@@ -2,74 +2,69 @@
 
 ## Scope and evidence standard
 
-This review covers Zingg's current integration with the bundled SecondString JAR and the Spark execution path around it. The goal is to distinguish facts that are visible in the code from hypotheses that still need profiling.
+This review covers Zingg's current integration with the bundled SecondString JAR and the Spark execution path around it. The goal is to distinguish facts visible in the code or shipped bytecode from hypotheses that still need profiling.
 
-The findings below use three evidence levels:
+The findings use three evidence levels:
 
-- **Confirmed**: directly established by the current Zingg/SecondString/Spark source or repository history.
-- **Mechanically derived**: complexity/allocation consequences that follow directly from those data structures, but are not yet production measurements.
-- **Workload-dependent hypothesis**: a plausible optimization whose end-to-end importance must be measured on representative jobs.
+- **Confirmed**: directly established by current Zingg/SecondString/Spark source, repository history, or the bytecode in Zingg's bundled JAR.
+- **Mechanically derived**: complexity/allocation consequences that follow directly from those data structures, but are not production measurements.
+- **Workload-dependent hypothesis**: a plausible optimization whose end-to-end importance still needs representative profiling.
 
-This distinction matters. The code is old enough to contain several obvious allocation-heavy designs, but source inspection alone cannot tell us which similarity metric dominates a particular production workload.
+No production-wide speedup ranking is claimed until allocation and CPU profiles are captured.
 
 ## Executive summary
 
-The revised priority is:
-
-1. **Fix confirmed correctness/resource-safety problems first.** Two stand out: Spark UDF registration can alias different functions under the same name, and SecondString's default Jaccard tokenizer keeps a process-wide, mutable, unbounded token-interning `TreeMap`.
-2. **Measure the existing fuzzy path before globally ranking algorithms.** Zingg's existing FEBRL 120K and NC Voters 5M performance jobs already exercise Monge-Elkan/AffineGap and Jaro heavily, so they are suitable A/B harnesses.
-3. **Treat AffineGap rolling rows as a high-confidence per-call memory optimization, not yet as the globally largest production win.** Its current storage cost is mechanically large and can be reduced from O(m*n) to O(n), but total job impact depends on how many fuzzy comparisons are executed and what else dominates the Spark stage.
-4. **Treat Spark's per-feature Java UDF boundary as a first-class target.** Zingg registers each similarity separately as `UDF2` and calls it through `functions.callUDF`; Spark 3.5.5's generated code must convert/box values around Java UDF calls and cannot inline the similarity implementation into Catalyst.
-5. **Modernize data layout before considering explicit SIMD.** Zingg currently compiles for Java 11, while `jdk.incubator.vector` is unavailable on that baseline and is still incubating in current newer JDKs. Primitive, allocation-light scalar loops should come first; HotSpot auto-vectorization should be measured before introducing a separate Vector-API build path.
-
-No production-wide speedup ranking is claimed until allocation/CPU profiles are captured.
+1. **Correctness and resource-safety come first, with compatibility baselines before fixes.** Spark UDF registration can alias TEXT and NUMERIC Jaccard under the same name, changing which scorer actually runs. Fixing that changes feature values for affected models, so it is a compatibility-affecting correctness fix, not a performance-neutral cleanup.
+2. **SecondString's default Jaccard tokenizer defeats Spark task isolation.** `SimpleTokenizer.DEFAULT_TOKENIZER` is static, mutable, unbounded, and backed by an unsynchronized `TreeMap`. Every distinct token is retained for the process/classloader lifetime. The safest first mitigation is not a Jaccard rewrite: pass a fresh `SimpleTokenizer(true, true)` into each `SJacc` instance, preserving the same tokenizer/scoring algorithm while removing process-wide singleton state.
+3. **Baseline score vectors belong before either correctness fix or tokenizer replacement.** Differential vectors against the exact bundled JAR, UDF-alias reproduction, and deterministic tokenizer-identity/state assertions belong in the first PR. JFR/JMH attribution is a separate later step.
+4. **The shipped JAR bytecode confirms the FUZZY AffineGap path and the historical `i=1` anomaly.** `MongeElkan` in the bundled artifact extends `AffineGap` and invokes `AffineGap.score`; `AffineGap$MatrixTrio.compute` contains the `iconst_1` / `istore` sequence corresponding to the source expression `i=1` before the `InsertTMatrix.get` lookup. These are properties of the artifact Zingg ships, not merely current upstream source.
+5. **AffineGap remains a high-confidence per-call memory target.** Three memo matrices allocate `double[][]` and `boolean[][]` storage. A score-only rolling-row implementation can reduce working storage from O(m*n) to O(min(m,n)), but end-to-end priority still depends on profiling.
+6. **Explicit Vector API implementation is deferred under the current Java 11 build, but SIMD-readiness is now a design constraint.** The Spark 4 / Java 17+ transition is the natural boundary for an optional vector backend. Scalar rewrites should therefore use flat primitive storage, simple loops, and narrow kernels that can later gain a vector implementation without another architecture rewrite.
+7. **Spark's per-feature Java UDF boundary is itself an optimization surface.** FUZZY currently evaluates AffineGap and Jaro as separate UDFs over the same pair of strings, repeating conversion and generic Java-UDF overhead.
 
 ---
 
-## 1. What artifact does Zingg actually run?
+## 1. Artifact provenance: inspect the binary Zingg actually ships
 
-### Confirmed: `2021` is a synthetic local Maven version
-
-Zingg does not resolve a public upstream `com.wcohen.ss:secondstring:2021` release. The root build installs:
+Zingg's root build installs:
 
 ```text
 thirdParty/lib/secondstring.jar
 ```
 
-into the local Maven repository and assigns it the coordinates:
+under the synthetic Maven coordinate:
 
 ```text
 com.wcohen.ss:secondstring:2021
 ```
 
-The bundled JAR is currently 201,564 bytes with Git blob SHA:
+The repository blob is 201,564 bytes and has Git blob SHA:
 
 ```text
 92ddf6c9a48e010e9bf4e748956bf52c89a67b9b
 ```
 
-Repository history shows that this JAR was added in the initial Zingg repository import on 2021-08-25 and has not subsequently changed.
+That Git SHA is useful for repository identity, but it is **not** a portable file checksum because Git hashes its own `blob <length>\0` framing together with the content. The portable artifact fingerprint must be the raw JAR's **SHA-256**.
 
-### Strong provenance evidence, but not byte-for-byte proof
+A dedicated exact-artifact inspection should therefore record together:
 
-SourceForge's June 2012 SecondString release is `secondstring-20120620.jar` (reported as 201.2 kB). The last TeamCohen source commit before that release is:
+- raw JAR SHA-256;
+- byte size;
+- Git blob SHA, as a repository locator only;
+- class-file major version;
+- whether `SourceFile`, `LineNumberTable`, and `LocalVariableTable` metadata survived;
+- selected `javap -c -p` output for the load-bearing classes.
 
-```text
-a332794d08b8bf420abb2a0607eaf9c8d0a0d95f
-2012-05-18
-```
+The JAR was added in Zingg's initial repository import on 2021-08-25 and has not subsequently changed. Source history strongly resembles the June-2012 SecondString lineage, but file size similarity is not provenance proof and is no longer used to resolve runtime behavior.
 
-The `AffineGap.java` blob at that historical revision is byte-identical at the source-file level to current TeamCohen `master` (`829cb55f...`) and already contains the `i=1` expression discussed below.
+### Confirmed from the vendored bytecode
 
-This makes the June-2012 lineage much more relevant than current GitHub HEAD alone. However, the bundled Zingg JAR has **not** been byte-compared with the SourceForge JAR in this review, so the report does not claim exact binary identity.
+The exact bundled JAR establishes both previously open questions:
 
-### Action
+- `com.wcohen.ss.MongeElkan` is a subclass of `com.wcohen.ss.AffineGap` and calls the inherited AffineGap scoring path.
+- `com.wcohen.ss.AffineGap$MatrixTrio.compute` contains the bytecode pattern generated by the source assignment `i=1`: an `iconst_1` followed by storing that value into the local corresponding to `i` before the value is used for the `InsertTMatrix.get` lookup.
 
-Before changing score semantics, add one reproducible artifact-provenance check to the build or release documentation:
-
-- checksum the bundled JAR;
-- identify the exact upstream release/source revision it came from;
-- ideally replace the synthetic `2021` coordinate with a documented vendored-artifact version/checksum.
+The recurrence anomaly is therefore present in the binary Zingg actually executes. Any optimized replacement must make an explicit compatibility decision rather than assuming the mathematically expected `i-1` behavior.
 
 ---
 
@@ -77,51 +72,31 @@ Before changing score semantics, add one reproducible artifact-provenance check 
 
 | Zingg match path | Zingg implementation | SecondString runtime path | Status |
 |---|---|---|---|
-| `FUZZY` string | `AffineGapSimilarityFunction` | `SAffineGap -> MongeElkan -> AffineGap` | active |
+| `FUZZY` string | `AffineGapSimilarityFunction` | `SAffineGap -> MongeElkan -> AffineGap` | active, bytecode/source chain verified |
 | `FUZZY` string | `JaroWinklerFunction` | `SJaroWinkler -> Jaro` | active |
 | `TEXT` string | `JaccSimFunction` | `SJacc -> Jaccard -> SimpleTokenizer.DEFAULT_TOKENIZER` | active |
-| `NUMERIC` string | `NumbersJaccardFunction` | constructs `SJacc`, but `call()` does not use it | active Zingg code, dead SecondString scorer |
+| `NUMERIC` string | `NumbersJaccardFunction` | constructs `SJacc`, but `call()` does not use it | active Zingg code; dead SecondString scorer |
 | `EMAIL` string | `EmailMatchTypeFunction` | `SAffineGap -> MongeElkan -> AffineGap` after local-part extraction | active |
 | `ONLY_ALPHABETS_FUZZY` | `OnlyAlphabetsAffineGapSimilarity` | `SAffineGap -> MongeElkan -> AffineGap` after filtering | active |
-| `BigramJaccSimFn` | `BigramJaccard` | `Jaccard` with custom tokenizer | class exists but is not wired by current `StringFeature` |
+| `BigramJaccSimFn` | `BigramJaccard` | custom-tokenizer Jaccard | class exists but is not wired by current `StringFeature` |
 
-### The AffineGap path is definitely reachable
+For every `FUZZY` field, `StringFeature` adds both `AffineGapSimilarityFunction` and `JaroWinklerFunction`. The existing FEBRL 120K configuration contains eight FUZZY fields, so each candidate pair reaches eight Monge-Elkan/AffineGap calls and eight Jaro calls. NC Voters 5M contains two FUZZY fields.
 
-For a `FUZZY` string field, `StringFeature.addSimFunctionsForFuzzyString()` adds both:
-
-```java
-new AffineGapSimilarityFunction();
-new JaroWinklerFunction();
-```
-
-`AffineGapSimilarityFunction` creates `SAffineGap`; `SAffineGap` extends `MongeElkan`; and `MongeElkan.score()` calls `super.score(...)`, i.e. `AffineGap.score()`.
-
-The earlier analysis was wrong to leave this call chain implicit. What remains unknown is **how much of a production job's wall time it accounts for**, not whether the code is reached.
-
-### Existing performance workloads exercise it heavily
-
-The existing repository performance configs are useful here:
-
-- FEBRL 120K has **eight** `FUZZY` string fields. Each candidate pair therefore executes eight Monge-Elkan/AffineGap UDF calls and eight Jaro UDF calls.
-- NC Voters 5M has **two** `FUZZY` string fields.
-
-The latest stored reports (2026-06-28) show match durations of 5.82 minutes for FEBRL 120K and 52.43 minutes for NC Voters 5M. Those numbers are end-to-end baselines only; they do not attribute time to SecondString.
+The latest stored end-to-end match reports (2026-06-28) are 5.82 minutes for FEBRL 120K and 52.43 minutes for NC Voters 5M. They are useful A/B baselines but do not attribute time to a particular similarity implementation.
 
 ---
 
-## 3. Confirmed correctness and resource-safety findings
+## 3. P0 correctness: Spark UDF identity aliasing
 
-### P0: Spark UDF registration can alias different implementations
-
-`NumbersJaccardFunction` currently calls:
+`NumbersJaccardFunction` uses the logical name:
 
 ```java
 super("JaccSimFunction");
 ```
 
-which gives it the same logical function name as `JaccSimFunction`.
+which is also the name of the TEXT Jaccard implementation.
 
-`SparkTransformer` currently uses `function.getName()` as its UDF registration identifier, and `SparkFnRegistrar` deliberately skips registration when that identifier already exists:
+`SparkTransformer` uses `function.getName()` as the Spark UDF registration identifier, while `SparkFnRegistrar` deliberately avoids replacing an already registered function:
 
 ```java
 if (!sparkSession.catalog().functionExists(functionName)) {
@@ -129,162 +104,155 @@ if (!sparkSession.catalog().functionExists(functionName)) {
 }
 ```
 
-Therefore, if a model contains both TEXT Jaccard and NUMERIC Jaccard, whichever implementation registers first under `JaccSimFunction` remains registered and the other transformer calls the same already-registered UDF.
+A model containing both TEXT and NUMERIC Jaccard can therefore cause both transformers to invoke whichever implementation registered first under `JaccSimFunction`. `ModelUtil` uses a `LinkedHashMap`, so the result follows field-definition order rather than being random, but one field is still evaluated with the wrong scorer.
 
-`ModelUtil` uses a `LinkedHashMap`, so this is deterministic with field-definition order rather than random, but it is still semantically wrong for one of the fields.
+### Compatibility impact
 
-#### Recommended fix
+Fixing this is **not score-neutral**. Affected models currently receive incorrect feature values for one of the two fields. Giving each UDF a unique registration identity will change those values to the intended values, which can alter training and inference outcomes.
 
-Decouple the internal Spark UDF identifier from the public feature/function name. A low-risk option is to use the already-unique generated output column (`z_sim_<count>`) as the registration ID while leaving output-column naming and model feature semantics unchanged.
+The implementation surface can be small—for example, use the already-unique generated output-column identity as the internal UDF identifier—but behavioral risk must be treated like any other model-feature semantic change.
 
-This should be fixed independently of performance benchmarking.
+### Required baseline before the fix
+
+The baseline PR must:
+
+- construct a model containing both TEXT and NUMERIC Jaccard;
+- run it in both field orders;
+- demonstrate which scorer wins registration today;
+- pin the current feature outputs;
+- separately pin the intended scorer outputs;
+- document that the subsequent fix changes affected feature values and may require model retraining/revalidation.
 
 ---
 
-### P0/P1: default SecondString Jaccard has process-wide unbounded interning state
+## 4. P0/P1 resource safety: default Jaccard tokenizer state
 
-SecondString's default Jaccard constructor uses:
+SecondString's default constructor is equivalent to:
 
 ```java
-SimpleTokenizer.DEFAULT_TOKENIZER
+public Jaccard() {
+    this(SimpleTokenizer.DEFAULT_TOKENIZER);
+}
 ```
 
-which is a static singleton. That tokenizer contains:
+and `SimpleTokenizer.DEFAULT_TOKENIZER` is a static singleton. The tokenizer contains mutable global vocabulary state conceptually equivalent to:
 
 ```java
 private int nextId = 0;
 private Map tokMap = new TreeMap();
 ```
 
-Every previously unseen token is added to `tokMap` and never removed.
+Every unseen token is interned into that map and never removed.
 
-Zingg's `SJacc` has no explicit constructor, so `Jaccard()` selects this singleton. `JaccSimFunction` constructs `SJacc` for TEXT similarity.
+### Structural consequences
 
-#### Consequences
+1. Retained memory grows with all distinct tokens seen by the JVM/classloader, rather than the working set of one comparison or one task.
+2. Intern lookup becomes O(log V), where V is process-wide vocabulary cardinality.
+3. `TreeMap` and the surrounding `nextId` mutation are not synchronized.
+4. `BagOfTokens` adds per-input `TreeMap` and boxed count state even though plain Jaccard only needs distinct set membership.
 
-These are structural, not speculative:
+### Why the static singleton matters specifically in Spark
 
-1. **Retained memory grows with vocabulary cardinality, not with one comparison.** Every unique token seen by the executor/classloader remains strongly referenced.
-2. **Lookup cost grows as O(log V)** because token interning uses `TreeMap`, where `V` is all distinct tokens seen so far by that tokenizer.
-3. **The state is shared and mutable.** `TreeMap` is not thread-safe. Zingg's current performance tests use Spark `local[*]`, and normal Spark executors also execute multiple task threads in one JVM, so a process-wide mutable tokenizer is an unsafe design for parallel matching.
-4. **Jaccard builds more state than it needs.** `BagOfTokens` creates another `TreeMap` per input and allocates boxed `Double` counts, even though plain Jaccard only needs distinct-token membership and cardinalities.
+Spark executors run tasks on a thread pool. Spark 3.5.5 deserializes a separate task and then deserializes the RDD/function for that task. In the normal execution path, mutable state stored **inside the serialized UDF/function instance** is therefore task-owned after deserialization.
 
-This finding changes the optimization roadmap materially. For high-cardinality TEXT workloads, replacing this Jaccard path can improve both boundedness and throughput and may be more important than AffineGap.
+The static `SimpleTokenizer.DEFAULT_TOKENIZER` bypasses that ownership boundary: independently deserialized `SJacc`/`Jaccard` instances reconnect to the same classloader-global tokenizer object inside the executor JVM.
 
-#### Recommended Zingg-side replacement
+This substantially strengthens the safe intermediate mitigation below: a tokenizer held as ordinary instance state should remain isolated with the task/UDF instance rather than shared by the static singleton. The baseline suite should still assert this identity behavior directly under Zingg's Spark execution path so that the assumption is regression-tested rather than left implicit.
 
-Implement a compatibility-preserving Jaccard scorer that:
+### Tests: deterministic evidence first, stress only as corroboration
 
-- tokenizes letter runs and digit runs with the same semantics as `SimpleTokenizer(true, true)`;
-- ignores punctuation;
-- treats duplicate tokens as one set element;
-- uses per-comparison compact state with no global interning;
-- uses a small-array representation for the common low-token-count case and a primitive/open-addressed representation only past a measured crossover;
-- initially falls back to legacy SecondString for non-ASCII/locale-sensitive cases if exact equivalence is not proven.
+A concurrency stress test must **not** be a pass/fail proof that the current implementation is safe. Unsynchronized races are nondeterministic; a clean run proves nothing.
 
-For an ASCII fast path, token slices can be hashed/compared case-insensitively without materializing token `String`s. This would remove the global vocabulary map entirely.
+The baseline should contain deterministic structural assertions that always hold for the current artifact:
+
+- two default `Jaccard`/`SJacc` instances resolve to the same tokenizer object by identity;
+- the tokenizer's interning state is mutable instance state on that singleton;
+- its relevant mutation methods/fields are not synchronized;
+- task-deserialized scorer instances in the Zingg/Spark path are distinct, while the default tokenizer identity is still shared because it is static.
+
+Then add a repeated concurrent stress test only as corroboration, looking for observable signatures such as:
+
+- lost or inconsistent insertions;
+- duplicate/inconsistent token IDs under contested insertion;
+- map traversal/ordering anomalies;
+- exceptions or corrupted state.
+
+Absence of those signatures in one run is not evidence of safety.
 
 ---
 
-### P0 compatibility question: the AffineGap `i=1` expression predates the 2012 release
+## 5. Safer intermediate Jaccard fix: isolate the existing tokenizer before rewriting it
 
-The source revision immediately preceding the June 2012 release contains:
+SecondString exposes `Jaccard(Tokenizer)`. Therefore removing process-wide tokenizer retention does **not** require rewriting the Jaccard algorithm or tokenizer semantics.
+
+A minimal Zingg-side change can make `SJacc` construct the same tokenizer configuration explicitly:
 
 ```java
-it.get(i=1,j-1) + matchScore
+public SJacc() {
+    super(new SimpleTokenizer(true, true));
+}
 ```
 
-rather than the likely intended:
+The exact constructor/API is pinned against the bundled binary in the baseline suite before this lands.
 
-```java
-it.get(i-1,j-1) + matchScore
-```
+### Why this is the preferred first change
 
-That historical file has the same blob SHA as current TeamCohen `master`, so this is not a recent GitHub regression.
+- It keeps SecondString's existing Jaccard scoring implementation.
+- It keeps `SimpleTokenizer(true, true)` tokenization semantics.
+- It removes the classloader-global vocabulary map from Zingg's normal `SJacc` path.
+- Under Spark's normal task-deserialization model, each scorer/UDF instance owns its tokenizer instead of reconnecting to the static singleton.
+- Compatibility risk is far lower than replacing tokenization, hashing, set representation, or case handling in one step.
 
-The expression assigns `1` to local `i` before the lookup. It is highly suspicious and inconsistent with the neighboring recurrence terms, but this review still does **not** assert that Zingg's bundled binary has been bytecode-verified to contain it.
+### What it does not solve
 
-#### Action before a fast implementation
+It does not remove per-comparison `BagOfTokens` allocation, `TreeMap` lookup cost inside each tokenizer, or object-heavy token representations. Those are performance issues and belong **after** profiling and differential score baselines.
 
-- add score regression vectors against the actual bundled JAR;
-- independently implement the mathematically intended recurrence;
-- compare outputs over randomized strings;
-- decide whether a corrected algorithm needs a new feature/version name rather than silently changing historical model features.
+If testing reveals any Zingg execution path that deliberately shares one scorer instance across concurrent calls, the isolation policy for that path must become task-local/thread-local rather than merely per-instance. Do not jump to per-call construction unless evidence shows it is necessary, because it would reintroduce avoidable allocation.
 
 ---
 
-### P0 compatibility question: `SJaroWinkler` is actually Jaro
+## 6. AffineGap / Monge-Elkan memory and inner-loop work
 
-`SJaroWinkler` extends `com.wcohen.ss.Jaro`, not `JaroWinkler`.
-
-This means Zingg's `JaroWinklerFunction` naming does not match its current score semantics. It should be documented and tested, but not silently changed in a performance PR because similarity values are ML features.
-
----
-
-## 4. AffineGap / Monge-Elkan: confirmed per-call memory problem
-
-### Current representation
-
-Each `MemoMatrix` allocates both:
+Each SecondString `MemoMatrix` allocates:
 
 ```java
 double[][] value;
 boolean[][] computed;
 ```
 
-for `(m + 1) * (n + 1)` cells.
+for `(m + 1) * (n + 1)` cells. `AffineGap.MatrixTrio` constructs three such matrices.
 
-`AffineGap.MatrixTrio` constructs **three** such matrices: the main matrix and the two gap-state matrices.
-
-On HotSpot, looking only at array payloads (8-byte doubles and approximately one byte per boolean) and ignoring row/object headers and alignment, the storage is approximately:
+Ignoring nested-array headers/alignment and counting only 8-byte doubles plus approximately one byte per boolean, payload is approximately:
 
 ```text
 3 * (m + 1) * (n + 1) * 9 bytes
 ```
 
-before any other scorer allocation.
-
 For equal-length inputs:
 
-| Length | Matrix payload estimate/call | Six rolling double rows |
+| Length | Current matrix payload estimate/call | Six rolling double rows |
 |---:|---:|---:|
 | 20 | ~11.6 KiB | ~1.0 KiB |
 | 50 | ~68.6 KiB | ~2.4 KiB |
 | 80 | ~173.0 KiB | ~3.8 KiB |
 | 256 | ~1.70 MiB | ~12.0 KiB |
 
-The current implementation allocates the full arrays even though `MemoMatrix` computes cells lazily. `AffineGap.score()` then scans every main-matrix cell to find the best score, so the main matrix is fully demanded anyway.
+The estimate is conservative because it omits every row-array/object header.
 
-### Mechanically justified optimization
+A score-only affine-gap implementation can use rolling primitive rows and reduce temporary storage to O(min(m,n)). This is a mechanically strong per-call optimization, but its end-to-end rank remains workload-dependent.
 
-A score-only affine-gap recurrence can keep rolling primitive rows for the required states. This changes temporary storage from O(m*n) to O(min(m,n)) while preserving double arithmetic.
+### Recurrence compatibility constraint
 
-This is a **high-confidence per-call memory improvement**. Whether it is the largest end-to-end Zingg improvement is workload-dependent.
+The vendored bytecode contains the historical `i=1` assignment anomaly. Therefore the first rolling-row implementation must be differential-tested against the bundled binary and should not silently combine:
 
-### Implementation notes
+- memory-layout optimization, and
+- mathematical recurrence correction.
 
-- Put the shorter string on the row-array dimension where recurrence semantics permit.
-- Keep the existing explanation/full-matrix path separate if `explainScore()` needs the matrix.
-- Do not mix the recurrence-correction decision with the memory-layout change; benchmark a compatibility mode and a mathematically corrected mode separately.
-- Use flat primitive arrays, not nested arrays.
+If the recurrence is corrected, that must be a separately named/managed semantic change.
 
----
+### Monge-Elkan character classification
 
-## 5. Monge-Elkan character scoring: remove object/hash work from the DP cell
-
-For a non-exact character pair, the historical/current code constructs two `Character` objects and probes seven `HashSet`s to discover approximate-match classes.
-
-A compact classifier can represent the same ASCII groups directly:
-
-- `d/t`
-- `g/j`
-- `l/r`
-- `m/n`
-- `b/p/v`
-- `a/e/i/o/u`
-- comma/period
-
-For example, a guarded ASCII table can map chars to small class IDs:
+The current source lineage boxes/probes hash sets for approximate character classes inside the O(m*n) DP. A compact ASCII table/switch is a natural scalar optimization, but it must guard arbitrary Java chars before indexing:
 
 ```java
 if (c < 128 && d < 128) {
@@ -294,283 +262,212 @@ if (c < 128 && d < 128) {
 }
 ```
 
-The guard is essential; indexing a 128-entry table with arbitrary Java `char` values is invalid.
-
-A non-ASCII fallback can preserve existing `Character.toLowerCase` behavior.
-
-This removes hashing and pointer chasing from an O(m*n) inner loop. The actual CPU gain still needs measurement because HotSpot may scalar-replace some short-lived objects after inlining.
+Non-ASCII behavior remains on a compatibility fallback until differential tests prove equivalence.
 
 ---
 
-## 6. Jaro: allocation-heavy source path, but lowercasing was overstated previously
+## 7. Jaro allocation hypothesis
 
-The earlier version of this report said `toLowerCase()` necessarily creates new strings. That is too strong.
+The source path confirms:
 
-What is confirmed by source:
+- `prepare()` invokes `String.toLowerCase()` on both inputs;
+- lowercasing may return the original string when no character changes, so allocation is input/JDK/locale dependent;
+- each input is wrapped;
+- two `commonChars()` passes create mutable result/copy buffers and materialized common-character strings;
+- another pass counts transpositions.
 
-- `AbstractStringDistance.score(String, String)` calls `prepare()` for both inputs.
-- `Jaro.prepare()` invokes `String.toLowerCase()` and wraps each result in `BasicStringWrapper`.
-- `String.toLowerCase()` can return the original object when no character changes; allocation therefore depends on the input/JDK/locale behavior.
-- Each `commonChars()` call creates a result `StringBuffer` and a mutable `StringBuffer` copy of the opposite string, then materializes a result string.
-- `commonChars()` is called in both directions, followed by another pass to count transpositions.
+This is a credible allocation/locality target, but bytes/op must be measured because lowercasing and escape analysis make source-level allocation counts unreliable.
 
-So there is a real allocation/locality hypothesis, but the **actual bytes/op must be measured** because lowercasing may allocate zero, one, or two strings and HotSpot escape analysis may eliminate some temporary objects.
-
-### Proposed implementation after measurement
-
-An allocation-light Jaro fast path can use primitive match-marker arrays and direct transposition counting. Start with ASCII-compatible behavior and retain legacy fallback for non-ASCII/locale-sensitive cases until differential tests demonstrate equivalence.
-
-Bound any reused scratch arrays so one outlier long string does not permanently enlarge per-thread executor state.
+An allocation-light implementation should use primitive match markers and direct transposition counting, with bounded scratch reuse and differential tests preserving **Jaro** semantics. `SJaroWinkler` currently extends plain `Jaro`; correcting that naming/algorithm mismatch is a separate model-feature semantic decision.
 
 ---
 
-## 7. Zingg-side preprocessing has independent hot-path waste
+## 8. Spark UDF boundary
 
-Several active functions do expensive work before SecondString is entered.
+Zingg builds one `SparkTransformer` per similarity function and registers a Java `UDF2<T,T,Double>`. Spark 3.5.5 generated code converts inputs around Java UDF calls, invokes a function object, and converts/unboxes the result. Catalyst cannot inline the internal SecondString algorithm.
 
-### `NumbersJaccardFunction`
+For a FUZZY field, AffineGap and Jaro therefore cross the Java-UDF boundary separately over the same pair of strings.
 
-Confirmed source behavior per call includes:
+Experiments after attribution should compare:
 
-- `Pattern.compile("\\d+")`;
-- two new `HashSet<String>` instances;
-- `Matcher` objects and matched-substring materialization;
-- several debug-message string concatenations even when DEBUG logging is disabled;
-- construction of an `SJacc` scorer in the constructor even though `call()` never uses `gap`.
-
-At minimum, the pattern should be `static final` and debug concatenation should be guarded. A manual digit-run scanner can go further, but should be benchmarked against the simple static-Pattern change.
-
-### `OnlyAlphabetsAffineGapSimilarity`
-
-It calls `replaceAll("[0-9.]", "")` on both inputs before the DP scorer. A single-pass filter can preserve the exact ASCII-digit/dot semantics and return the original string when there is nothing to remove, avoiding regex work and often avoiding allocation entirely.
-
-### `EmailMatchTypeFunction`
-
-It calls `split("@", 0)` on both emails but consumes only element zero. Modern JDKs have a fast path for simple one-character `String.split` delimiters, so this should not be described as full regex compilation on every call. It still creates a result array and domain substrings that are immediately discarded. `indexOf('@')` plus a prefix slice/string avoids that unnecessary work.
-
-These cleanups are low-risk candidates for a separate PR because they need not change SecondString's score algorithm.
+1. current per-feature UDF baseline;
+2. one fused same-field FUZZY UDF that converts/checks the pair once and returns both similarities;
+3. a larger one-pass base-feature-vector transformer;
+4. Catalyst-native expressions only if profiling proves the UDF boundary is material enough to justify coupling to Spark internals.
 
 ---
 
-## 8. Spark execution is a confirmed optimization surface
+## 9. SIMD readiness and the Spark 4 / Java 17+ boundary
 
-### One Java UDF per similarity feature
+Current Zingg `main` targets Spark 3.5.5 / Scala 2.12 and compiles with Java source/target 11. Explicit `jdk.incubator.vector` code therefore cannot live in the current Java-11-compatible core.
 
-`SparkModel` constructs one `SparkTransformer` per `SimFunction`.
+That does **not** mean SIMD should be ignored. Spark 4's Java 17+ requirement creates a natural future build boundary, so scalar work should be designed to accept a later vector backend without another data-layout rewrite.
 
-Each transformer registers a Java `UDF2<T,T,Double>` and applies it with:
+### Design constraints to adopt now
 
-```java
-functions.callUDF(uid, leftColumn, rightColumn)
-```
+- flat primitive arrays instead of nested/object-heavy structures where practical;
+- simple contiguous loops and branch-light kernels;
+- bounded reusable scratch buffers;
+- narrow internal kernel interfaces rather than vector types leaking through public APIs;
+- scalar implementation as the reference semantics for differential testing;
+- dispatch chosen once per scorer/task/backend, never inside DP cells.
 
-For a fuzzy field, AffineGap and Jaro are therefore two independent UDF expressions over the same pair of strings.
+### Future Spark 4 experiment
 
-### Spark 3.5.5 generated-code behavior
+When the Spark 4 build profile is available, benchmark an optional Java-17+/Vector-API backend against:
 
-Spark 3.5.5's `ScalaUDF.doGenCode` explicitly treats Java UDFs as the untyped case. Generated code:
+- scalar Java-11-compatible implementation;
+- the same scalar implementation on the newer JVM;
+- explicit vector implementation.
 
-- converts non-primitive Catalyst inputs through converter functions;
-- boxes primitive inputs where relevant;
-- calls the UDF through a function object (`udf.apply(...)`);
-- converts/unboxes the result back to Catalyst representation.
+Only ship the vector backend if its gain survives setup/conversion costs and representative end-to-end Spark tests. Keep it in a separate optional module/profile while the Vector API remains incubating rather than embedding incubator dependencies into the compatibility core.
 
-For StringType, this means the similarity implementation does not operate directly on Catalyst `UTF8String`; the Java UDF receives Java objects/strings. Catalyst cannot inline or reason about the internals of Jaro/AffineGap/Jaccard.
+### Best candidates
 
-### Optimization experiments to benchmark
+SIMD-readiness is most useful for:
 
-#### A. Fuse same-field similarities into one Java UDF
+- ASCII classification/filtering;
+- normalization/scanning;
+- token hashing/intersection over primitive data;
+- other contiguous primitive-array kernels exposed by the scalar rewrites.
 
-For a FUZZY field, one composite UDF could:
-
-- convert the left/right strings once;
-- perform shared cheap checks once (`null`, empty, equality, lengths);
-- optionally share normalization;
-- return both base similarities.
-
-This keeps the stable public algorithms while reducing repeated UDF/conversion overhead. The return-container allocation cost must be included in the benchmark.
-
-#### B. Compute the base feature vector in one pass
-
-A more aggressive experiment is a single feature-vector transformer that computes all configured base similarities before `PolynomialExpansion`, instead of one `withColumn(callUDF(...))` per feature.
-
-Potential benefits:
-
-- one row boundary instead of N Java UDF boundaries;
-- fewer repeated Java String conversions;
-- easier scratch-buffer reuse;
-- direct production of the vector consumed by the ML pipeline.
-
-Risks include saved-model compatibility, feature observability, and a larger refactor.
-
-#### C. Catalyst-native expressions for the hottest metrics
-
-A custom Catalyst expression can avoid generic Java-UDF conversion and potentially operate on `UTF8String` directly. This offers the highest integration ceiling but couples Zingg to Spark internal APIs, so it should only follow profiling that proves the UDF boundary is material.
-
-#### D. Precompute reusable normalization selectively
-
-If one source record fans out to many candidate pairs, repeatedly lowercasing/filtering/tokenizing the same value is wasteful. Precomputing normalized columns before pair expansion can help, but increases row width and shuffle/persistence cost. Use a fanout-aware benchmark rather than adding a JVM-global cache.
+Jaro match windows and affine-gap recurrence dependencies are weaker direct vector targets. A striped/wavefront AffineGap variant is an experiment, not a roadmap assumption.
 
 ---
 
-## 9. SIMD / Vector API: lower priority under the current Java baseline
+## 10. Low-risk Zingg preprocessing cleanups
 
-Zingg currently compiles with:
+These remain worthwhile but no longer precede correctness/resource-safety work:
 
-```text
-maven.compiler.source = 11
-maven.compiler.target = 11
-```
+- make numeric Jaccard's `Pattern.compile("\\d+")` static instead of per-call;
+- guard debug string construction;
+- remove the unused `SJacc` member from numeric Jaccard when API-safe;
+- replace `replaceAll("[0-9.]", "")` in only-alphabet fuzzy preprocessing with an exact single-pass ASCII digit/dot filter;
+- replace email `split("@", 0)` array creation with equivalent local-part extraction after edge-case regression tests.
 
-and the existing performance workflow explicitly runs Temurin Java 11.
-
-The JDK Vector API was introduced after Java 11 and remains an incubating module in modern JDKs (including JDK 25). Therefore a direct `jdk.incubator.vector` implementation is **not compatible with Zingg's current Java-11 build contract**.
-
-Real options would be:
-
-1. raise the Java baseline;
-2. ship a separate/multi-release optional implementation compiled on a newer JDK and dispatch at runtime;
-3. use JNI/native code, with significantly higher packaging/operational cost.
-
-None should precede the simpler primitive-layout work.
-
-### Near-term SIMD strategy
-
-- write flat primitive scalar loops first;
-- inspect whether HotSpot C2 auto-vectorizes normalization/classification loops;
-- use JMH + `perf`/JFR/assembly inspection to identify actual vectorization opportunities;
-- only introduce explicit Vector API code when a supported JVM profile and measurable gain justify the maintenance cost.
-
-Jaro's matching windows and affine-gap dependencies remain irregular SIMD targets. Character classification, ASCII scanning, hashing, and some primitive-array operations are more promising.
+They are independent allocation cleanups, not higher priority than the shared tokenizer state.
 
 ---
 
-## 10. Measurement plan that resolves the remaining ranking uncertainty
+## 11. Measurement plan
 
-### Step 1: capture allocation + CPU attribution on the existing perf workloads
+### A. Correctness/provenance baseline — before behavior or tokenizer-state changes
 
-Use the existing Java-11 `local[*]` performance jobs and add an opt-in profiling mode. JFR is available on the existing Temurin 11 runtime and can report:
+Capture and commit:
 
-- allocation hot spots;
-- GC pressure;
+- raw bundled-JAR SHA-256, byte size, and Git blob locator;
+- class-file major version and surviving debug attributes;
+- `javap` evidence for `MongeElkan -> AffineGap` and the `i=1` bytecode sequence;
+- differential score vectors against the bundled JAR for Jaccard, Jaro, and Monge-Elkan/AffineGap;
+- UDF alias reproduction in both TEXT/NUMERIC field orders;
+- deterministic tokenizer identity/mutability/synchronization assertions;
+- task/UDF instance-identity assertions showing static tokenizer sharing across otherwise distinct task scorer instances;
+- a non-gating concurrency stress test that records corruption signatures when observed.
+
+This baseline is the compatibility contract for every later scorer rewrite.
+
+### B. Profile attribution — after correctness baselines exist
+
+Use the existing Java-11 `local[*]` performance jobs with opt-in JFR to capture:
+
+- allocation hotspots;
 - CPU samples;
-- lock/contention signals;
-- thread activity.
+- GC pressure;
+- contention/thread activity;
+- stage-level wall time.
 
-Capture at least:
+Use at least FEBRL 120K and NC Voters 5M.
 
-- FEBRL 120K match phase (8 fuzzy fields);
-- NC Voters 5M match phase (2 fuzzy fields).
-
-Keep the current end-to-end minute-based regression reports as the final acceptance metric, but do not use wall time alone to choose what to optimize.
-
-### Step 2: microbenchmark isolated scorers
-
-JMH cases should include:
-
-- Jaro;
-- MongeElkan/AffineGap;
-- Jaccard;
-- Zingg numeric Jaccard;
-- wrapper preprocessing.
-
-Dimensions:
-
-- lengths 5-20, 20-80, 80-256, 256-1024;
-- lowercase vs mixed case;
-- ASCII vs Unicode;
-- identical, one-edit, moderate-similarity, dissimilar;
-- vocabulary cardinality for Jaccard, including long-running tests that expose the global intern map.
-
-Report:
-
-- throughput / ns-op;
-- bytes allocated/op;
-- GC events/time;
-- retained heap after many unique Jaccard tokens;
-- scalability under concurrent threads.
-
-### Step 3: A/B structural Spark experiments
-
-Measure separately:
-
-1. baseline per-feature UDFs;
-2. unique UDF-registration IDs only (correctness fix; should be perf-neutral);
-3. fused same-field fuzzy UDF;
-4. rolling-row AffineGap;
-5. allocation-light Jaro;
-6. replacement Jaccard without global interning;
-7. combinations of the above.
-
-This will show interaction effects and prevent attributing Spark-boundary wins to algorithm changes.
+Add JMH/focused microbenchmarks for scorer-level throughput and bytes/op over multiple lengths, similarity regimes, ASCII/Unicode inputs, and Jaccard vocabulary cardinalities/concurrency.
 
 ---
 
-## 11. Revised PR sequence
+## 12. Revised PR sequence
 
-### PR A — correctness: make Spark UDF registration identity unique
+### PR A — evidence and compatibility baselines
 
-- decouple registration ID from `SimFunction.getName()`;
-- preserve existing feature/output-column names;
-- add regression coverage for TEXT + NUMERIC Jaccard in one model.
+- exact bundled-artifact SHA-256 and bytecode metadata;
+- score differential vectors against the bundled JAR;
+- TEXT + NUMERIC UDF-alias reproduction and pinned current/intended outputs;
+- deterministic tokenizer-sharing/unsynchronized-state assertions;
+- Spark task/UDF ownership assertion;
+- non-gating concurrent stress corroboration.
 
-### PR B — profiling/benchmark guardrails
+This PR changes no scoring behavior.
 
-- opt-in JFR artifact for existing performance workflows;
-- JMH similarity benchmark module or focused benchmark harness;
-- regression vectors against the bundled SecondString binary.
+### PR B — UDF registration correctness
 
-### PR C — low-risk Zingg preprocessing cleanup
+- give each Spark UDF a unique internal registration identity;
+- preserve output-column/public feature naming where possible;
+- prove corrected outputs against PR A vectors;
+- document that affected mixed TEXT+NUMERIC models change feature values and require compatibility/retraining review.
 
-- static `Pattern` for numeric Jaccard;
-- guarded debug logging;
-- remove dead `SJacc` construction from numeric Jaccard where API-safe;
-- non-regex digit/dot filtering for only-alphabet fuzzy matching;
-- local-part extraction without `split` array creation.
+This is a correctness fix with behavioral impact, not a perf-neutral PR.
 
-### PR D — bounded/local Jaccard implementation
+### PR C — isolate Jaccard tokenizer state without reimplementing scoring
 
-- remove dependency on `SimpleTokenizer.DEFAULT_TOKENIZER` from Zingg's TEXT hot path;
-- no global token retention;
-- concurrency tests;
-- compatibility/differential tests;
-- benchmark small-array vs primitive-hash representations.
+- construct `SJacc` with a fresh `SimpleTokenizer(true, true)` instead of `DEFAULT_TOKENIZER`;
+- verify tokenizer identity is no longer shared across independently deserialized scorer/task instances;
+- rerun all Jaccard differential vectors from PR A;
+- verify long-running vocabulary retention is bounded by scorer/task lifetime rather than process-wide history.
 
-### PR E — rolling-row Monge-Elkan/AffineGap
+Do not combine this with a primitive Jaccard rewrite.
 
-- O(min(m,n)) working storage;
-- compact char-class lookup;
-- compatibility mode against the bundled JAR;
-- separate decision for the historical recurrence anomaly.
+### PR D — JFR/JMH attribution
 
-### PR F — allocation-light Jaro
+- opt-in JFR on existing Spark performance workloads;
+- focused JMH/scorer benchmarks;
+- allocation, GC, CPU, contention, and end-to-end deltas.
 
-- primitive match markers;
-- conditional/bounded scratch reuse;
-- ASCII fast path only after differential testing;
-- preserve existing Jaro semantics despite the `JaroWinklerFunction` name.
+Use these measurements to rank the remaining work.
 
-### PR G — fused Spark feature execution
+### PR E — primitive/local Jaccard performance rewrite, if D justifies it
 
-- first experiment with same-field FUZZY fusion;
-- then consider direct feature-vector construction or Catalyst-native expressions if profiling supports it.
+- replace object-heavy token/set representation without global interning;
+- keep PR A differential vectors as a hard score-equivalence gate;
+- benchmark small-array vs primitive-hash representation and crossover.
 
-### PR H — explicit SIMD only if still justified
+### PR F — rolling-row Monge-Elkan/AffineGap, if D justifies it
 
-Only after primitive scalar versions and JVM baseline decisions are complete.
+- O(min(m,n)) score-only working storage;
+- flat primitive arrays;
+- compact guarded character-class path;
+- exact compatibility mode against the bundled recurrence;
+- any recurrence correction handled separately as a semantic change.
+
+### PR G — allocation-light Jaro, if D justifies it
+
+- primitive match markers/direct transposition counting;
+- bounded scratch reuse;
+- preserve current Jaro semantics under differential tests.
+
+### PR H — Spark feature fusion, if D shows the UDF boundary is material
+
+- start with same-field FUZZY fusion;
+- evaluate one-pass feature-vector construction later;
+- consider Catalyst-native expressions only with strong profiling evidence.
+
+### PR I — independent preprocessing cleanup
+
+- static numeric pattern;
+- guarded logging;
+- dead scorer removal;
+- exact non-regex filtering/local-part extraction.
+
+### Spark 4 / Java 17+ follow-up — optional Vector API backend
+
+This is not an immediate implementation PR. The earlier scalar PRs should be SIMD-ready by construction. Once the Spark 4 build exists, compare scalar-on-new-JVM and explicit-vector backends and ship the latter only if measured value justifies the incubating API dependency.
 
 ---
 
-## 12. Bigram code: real defects, currently low runtime priority
+## 13. Bigram code
 
-`BigramJaccSimFn`/`BigramJaccard` contains suspicious behavior (one-character substrings despite the name, `TreeMap` interning, regex whitespace removal, and questionable token-array construction), but current `StringFeature` does not wire this function into normal match-type selection.
-
-It should receive correctness tests or be retired before reuse, but it should not be presented as a current production hot path without evidence that another extension/configuration instantiates it.
+`BigramJaccSimFn`/`BigramJaccard` contains suspicious behavior and object-heavy tokenization, but current `StringFeature` does not wire it into normal match-type selection. It needs correctness tests before reuse, but it is not ranked as a current production hot path without evidence of external instantiation.
 
 ---
 
 ## Bottom line
 
-The most important new conclusion is not a micro-optimization: **SecondString Jaccard's default tokenizer is process-wide mutable state with unbounded token retention**, and Zingg's Spark UDF registration can make different similarity implementations alias under one function name. Those are confirmed defects and should be addressed before speculative SIMD work.
+The roadmap is now compatibility-first rather than optimization-first. Pin the shipped artifact and current scores, reproduce the UDF alias, and make tokenizer sharing/task ownership deterministic facts. Then fix the UDF alias with explicit model-compatibility messaging and remove process-wide Jaccard tokenizer state through the smallest semantics-preserving constructor change before considering a custom tokenizer/Jaccard implementation.
 
-For FUZZY workloads, the AffineGap memory layout remains a compelling optimization because its per-call array payload is mechanically large and rolling rows reduce it by orders of magnitude. Existing Zingg performance jobs already execute that path heavily, so the next step is to capture allocation/CPU profiles there and let measurements decide whether rolling DP, Jaro allocation reduction, or Spark UDF fusion produces the largest end-to-end gain.
+After those safety fixes, JFR/JMH decides whether the next largest gain is rolling AffineGap, Jaro allocation reduction, primitive Jaccard, or Spark-UDF fusion. All scalar hot kernels should be written in SIMD-friendly primitive form so the upcoming Spark 4 / Java 17+ build can add an optional Vector API backend without rearchitecting them, but explicit Vector API code should wait for that build boundary and measured benefit.
