@@ -30,18 +30,28 @@ jobs:
           echo '=== Tokenizer API ==='
           javap -classpath "$JAR" -p com.wcohen.ss.api.Tokenizer
 
-          echo '=== MongeElkan declaration / bytecode ==='
-          javap -classpath "$JAR" -c -p com.wcohen.ss.MongeElkan
+          echo '=== MongeElkan full declaration / bytecode ==='
+          javap -classpath "$JAR" -c -p com.wcohen.ss.MongeElkan | tee /tmp/monge.txt
+          echo '=== MongeElkan score method only ==='
+          sed -n '/public double score(/,/public java.lang.String explainScore/p' /tmp/monge.txt
+
+          echo '=== AffineGap declaration ==='
+          javap -classpath "$JAR" -p com.wcohen.ss.AffineGap
+          echo '=== AbstractStringDistance declaration ==='
+          javap -classpath "$JAR" -p com.wcohen.ss.AbstractStringDistance
+
           echo '=== AffineGap MatrixTrio declaration / bytecode ==='
           javap -classpath "$JAR" -c -p 'com.wcohen.ss.AffineGap$MatrixTrio'
 
           echo '=== MongeElkan verbose metadata ==='
           javap -classpath "$JAR" -verbose -p com.wcohen.ss.MongeElkan | grep -E 'major version|SourceFile|LineNumberTable|LocalVariableTable' || true
-          echo '=== MatrixTrio verbose metadata ==='
-          javap -classpath "$JAR" -verbose -p 'com.wcohen.ss.AffineGap$MatrixTrio' | grep -E 'major version|SourceFile|LineNumberTable|LocalVariableTable' || true
+          echo '=== MatrixTrio compute verbose method ==='
+          javap -classpath "$JAR" -verbose -p 'com.wcohen.ss.AffineGap$MatrixTrio' > /tmp/matrix-verbose.txt
+          sed -n '/public double compute(int, int);/,/^}/p' /tmp/matrix-verbose.txt
 
           cat > /tmp/TokenizerProbe.java <<'EOF'
           import com.wcohen.ss.Jaccard;
+          import com.wcohen.ss.MongeElkan;
           import com.wcohen.ss.api.Tokenizer;
           import com.wcohen.ss.tokens.SimpleTokenizer;
           import java.lang.reflect.Field;
@@ -62,6 +72,21 @@ jobs:
                   throw new IllegalStateException("Tokenizer field not found");
               }
 
+              private static void printTokenizerFields(Class<?> start) {
+                  int count = 0;
+                  Class<?> c = start;
+                  while (c != null) {
+                      for (Field f : c.getDeclaredFields()) {
+                          if (Tokenizer.class.isAssignableFrom(f.getType())) {
+                              count++;
+                              System.out.println("tokenizer-field-in-hierarchy=" + c.getName() + "." + f.getName());
+                          }
+                      }
+                      c = c.getSuperclass();
+                  }
+                  System.out.println("tokenizer-field-count-in-hierarchy=" + count);
+              }
+
               public static void main(String[] args) throws Exception {
                   Jaccard a = new Jaccard();
                   Jaccard b = new Jaccard();
@@ -75,6 +100,8 @@ jobs:
                   Object tc = tokenizerOf(c);
                   Object td = tokenizerOf(d);
                   System.out.println("custom-tokenizer-distinct=" + (tc != td));
+
+                  printTokenizerFields(MongeElkan.class);
 
                   for (Field f : SimpleTokenizer.class.getDeclaredFields()) {
                       System.out.println("simple-tokenizer-field=" + Modifier.toString(f.getModifiers()) + " " + f.getType().getName() + " " + f.getName());
