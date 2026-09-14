@@ -38,7 +38,7 @@ artifacts:
 
 sync:
   paths:
-    - examples/databricks/FebrlExample.ipynb
+    - examples/databricks
     - examples/febrl
 
 targets:
