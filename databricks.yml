@@ -23,9 +23,12 @@ artifacts:
   zingg_jar:
     type: jar
     path: .
-    build: mvn -DskipTests clean package
+    build: |
+      mvn -DskipTests package
+      mkdir -p dist
+      cp assembly/target/zingg-0.7.0.jar dist/zingg.jar
     files:
-      - source: assembly/target/zingg-0.7.0.jar
+      - source: dist/zingg.jar
 
   zingg_python:
     type: whl
