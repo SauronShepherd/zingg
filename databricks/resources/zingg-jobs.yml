@@ -1,0 +1,49 @@
+resources:
+  jobs:
+    zingg:
+      name: zingg-${bundle.target}
+      description: Run Zingg phases from the bundled Zingg JAR.
+      parameters:
+        - name: phase
+          default: trainMatch
+        - name: config
+          default: ${var.config_path}
+      tasks:
+        - task_key: zingg
+          job_cluster_key: zingg_single_node
+          spark_jar_task:
+            main_class_name: zingg.spark.client.SparkClient
+            parameters:
+              - --phase
+              - "{{job.parameters.phase}}"
+              - --conf
+              - "{{job.parameters.config}}"
+          libraries:
+            - jar: ../../assembly/target/zingg-0.7.0.jar
+      job_clusters:
+        - job_cluster_key: zingg_single_node
+          new_cluster: &zingg_single_node
+            spark_version: ${var.spark_version}
+            node_type_id: ${var.node_type_id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
+
+    zingg_demo:
+      name: zingg-demo-${bundle.target}
+      description: Zingg out-of-the-box FEBRL Databricks notebook demo.
+      tasks:
+        - task_key: febrl_demo
+          job_cluster_key: zingg_demo_single_node
+          notebook_task:
+            notebook_path: ../../examples/databricks/FebrlExample.ipynb
+            source: WORKSPACE
+          libraries:
+            - whl: ../../python/dist/*.whl
+      job_clusters:
+        - job_cluster_key: zingg_demo_single_node
+          new_cluster:
+            <<: *zingg_single_node
