@@ -1,7 +1,7 @@
 bundle:
   name: zingg
   engine: direct
-  databricks_cli_version: ">= 0.295.0"
+  databricks_cli_version: ">= 1.3.0"
 
 include:
   - databricks/resources/*.yml
@@ -51,4 +51,4 @@ targets:
   prod:
     mode: production
     workspace:
-      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+      root_path: /Workspace/Production/.bundle/${bundle.name}/${bundle.target}
