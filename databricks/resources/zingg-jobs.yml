@@ -19,12 +19,13 @@ resources:
               - --conf
               - "{{job.parameters.config}}"
           libraries:
-            - jar: ../../assembly/target/zingg-0.7.0.jar
+            - jar: ../../dist/zingg.jar
       job_clusters:
         - job_cluster_key: zingg_single_node
           new_cluster:
             spark_version: ${var.spark_version}
             node_type_id: ${var.node_type_id}
+            data_security_mode: SINGLE_USER
             num_workers: 0
             spark_conf:
               spark.databricks.cluster.profile: singleNode
@@ -42,12 +43,14 @@ resources:
             notebook_path: ../../examples/databricks/FebrlExample.ipynb
             source: WORKSPACE
           libraries:
+            - jar: ../../dist/zingg.jar
             - whl: ../../python/dist/*.whl
       job_clusters:
         - job_cluster_key: zingg_demo_single_node
           new_cluster:
             spark_version: ${var.spark_version}
             node_type_id: ${var.node_type_id}
+            data_security_mode: SINGLE_USER
             num_workers: 0
             spark_conf:
               spark.databricks.cluster.profile: singleNode
