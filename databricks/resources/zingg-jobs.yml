@@ -25,7 +25,7 @@ resources:
           new_cluster:
             spark_version: ${var.spark_version}
             node_type_id: ${var.node_type_id}
-            data_security_mode: SINGLE_USER
+            data_security_mode: DATA_SECURITY_MODE_DEDICATED
             num_workers: 0
             spark_conf:
               spark.databricks.cluster.profile: singleNode
@@ -50,7 +50,7 @@ resources:
           new_cluster:
             spark_version: ${var.spark_version}
             node_type_id: ${var.node_type_id}
-            data_security_mode: SINGLE_USER
+            data_security_mode: DATA_SECURITY_MODE_DEDICATED
             num_workers: 0
             spark_conf:
               spark.databricks.cluster.profile: singleNode
