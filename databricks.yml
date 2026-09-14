@@ -1,0 +1,54 @@
+bundle:
+  name: zingg
+  engine: direct
+  databricks_cli_version: ">= 0.295.0"
+
+include:
+  - databricks/resources/*.yml
+
+variables:
+  spark_version:
+    description: Databricks Runtime used by the Zingg single-node jobs.
+    default: 16.4.x-scala2.12
+
+  node_type_id:
+    description: Single-node compute type. Override this for Azure or GCP workspaces.
+    default: i3.xlarge
+
+  config_path:
+    description: Path to the Zingg JSON configuration used by the generic JAR job.
+    default: ${workspace.file_path}/examples/febrl/config.json
+
+artifacts:
+  zingg_jar:
+    type: jar
+    path: .
+    build: mvn -DskipTests clean package
+    files:
+      - source: assembly/target/zingg-0.7.0.jar
+
+  zingg_python:
+    type: whl
+    path: python
+    build: |
+      cd ..
+      mvn -DskipTests package
+      cd python
+      python setup.py bdist_wheel
+
+sync:
+  paths:
+    - examples/databricks/FebrlExample.ipynb
+    - examples/febrl
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
