@@ -22,7 +22,7 @@ resources:
             - jar: ../../assembly/target/zingg-0.7.0.jar
       job_clusters:
         - job_cluster_key: zingg_single_node
-          new_cluster: &zingg_single_node
+          new_cluster:
             spark_version: ${var.spark_version}
             node_type_id: ${var.node_type_id}
             num_workers: 0
@@ -46,4 +46,11 @@ resources:
       job_clusters:
         - job_cluster_key: zingg_demo_single_node
           new_cluster:
-            <<: *zingg_single_node
+            spark_version: ${var.spark_version}
+            node_type_id: ${var.node_type_id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
