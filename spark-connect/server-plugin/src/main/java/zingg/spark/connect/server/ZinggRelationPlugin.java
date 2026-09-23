@@ -32,8 +32,8 @@ import zingg.spark.connect.proto.ZinggCommand;
  * returns a LogicalPlan -- so Spark streams the resulting rows back to the client,
  * which is exactly the two-way channel the label loop needs. The server side here
  * only produces the pairs (via the existing Labeller.getUnmarkedRecords()); the
- * actual yes/no/skip marking happens client-side, where a human is, and the marked
- * pairs are written back separately.
+ * actual yes/no/skip decision is collected client-side, where a human is, and
+ * submitted through ZinggCommandPlugin to the Java SparkLabeller for writing.
  *
  * Registration (server side):
  *   --conf spark.connect.extensions.relation.classes=zingg.spark.connect.server.ZinggRelationPlugin

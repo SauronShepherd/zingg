@@ -6,16 +6,13 @@ zingg.client.Zingg's py4j object-proxy with a single gRPC command per run.
 No py4j, no _jvm/_gateway, no _jsparkSession/_jdf reach-ins, no Databricks
 Connect special-casing -- see zingg_connect._connect for the wire bridge.
 
-Known limitation: the interactive label/findAndLabel loop needs a Spark
-Connect RelationPlugin (to stream row data back), which is not implemented
-in this module yet -- see zingg.spark.connect.server.ZinggCommandPlugin's
-docstring. Only the fire-and-execute phases are supported here: train,
-match, trainMatch, link, findTrainingData, generateDocs, recommend,
-updateLabel.
+The interactive label/findAndLabel loop uses a Spark Connect RelationPlugin to
+stream row data back. Label decisions are submitted through the CommandPlugin;
+the Java SparkLabeller owns validation and persistence.
 """
 
 from zingg_connect._connect import (
-    execute_zingg_command, fetch_zingg_relation, write_marked_pairs,
+    execute_zingg_command, fetch_zingg_relation, submit_zingg_labels,
 )
 from zingg_connect.options import ZinggOptions
 from zingg_connect.proto import zingg_command_pb2 as pb2
@@ -49,9 +46,9 @@ class Zingg:
         phase = self.inpOptions.getPhase()
         if phase in _UNSUPPORTED_PHASES:
             raise NotImplementedError(
-                f"Phase '{phase}' returns row data to the caller and needs a "
-                "Spark Connect RelationPlugin -- not implemented yet in "
-                "zingg_connect. Supported phases: "
+                f"Phase '{phase}' returns row data to the caller and uses the "
+                "Spark Connect RelationPlugin. Use getUnmarkedPairs() and "
+                "submitLabels() for labeling. Supported command phases: "
                 + ", ".join(p for p in ZinggOptions.ALL if p not in _UNSUPPORTED_PHASES)
             )
 
@@ -98,15 +95,27 @@ class Zingg:
         )
         return fetch_zingg_relation(self.remote, command)
 
-    def writeMarkedPairs(self, labels):
-        """Write the client's label decisions back to the model's marked
-        training data, so a subsequent train() picks them up. Paths are derived
-        from the Arguments (zinggDir + modelId) -- nothing is hardcoded.
+    def submitLabels(self, labels):
+        """Submit client-collected label decisions to the Java labeller.
 
         :param labels: iterable of (z_cluster, label), label 1=match, 0=no, 2=not sure
-        :returns: number of pairs written
         """
-        zingg_dir = self.inpArgs.getZinggDir()
-        model_id = self.inpArgs.getModelId()
-        base = f"{zingg_dir}/{model_id}/trainingData"
-        return write_marked_pairs(self.remote, f"{base}/unmarked", f"{base}/marked", labels)
+        labels = list(labels)
+        if not labels:
+            return 0
+        command = pb2.ZinggCommand(
+            phase=ZinggOptions.LABEL,
+            args=self.inpArgs.to_proto(),
+            options=self.inpOptions.to_proto(),
+        )
+        for cluster, label in labels:
+            decision = command.labels.add()
+            decision.z_cluster = str(cluster)
+            decision.label = int(label)
+        submit_zingg_labels(self.remote, command)
+        return len(labels)
+
+    # Compatibility alias for callers of the prototype API. The operation is
+    # now a Java-plugin submission rather than a Python-side Parquet write.
+    def writeMarkedPairs(self, labels):
+        return self.submitLabels(labels)

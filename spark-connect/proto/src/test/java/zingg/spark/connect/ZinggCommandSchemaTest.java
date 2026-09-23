@@ -16,6 +16,7 @@ import zingg.spark.connect.proto.Arguments;
 import zingg.spark.connect.proto.ClientOptions;
 import zingg.spark.connect.proto.FieldDefinition;
 import zingg.spark.connect.proto.Pipe;
+import zingg.spark.connect.proto.LabelDecision;
 import zingg.spark.connect.proto.ZinggCommand;
 
 class ZinggCommandSchemaTest {
@@ -23,7 +24,9 @@ class ZinggCommandSchemaTest {
 	@Test
 	void wireFieldNumbersRemainStableAndUnique() {
 		assertFieldNumbers(ZinggCommand.getDescriptor(),
-				new String[] { "phase", "args", "options" }, new int[] { 1, 2, 3 });
+				new String[] { "phase", "args", "options", "labels" }, new int[] { 1, 2, 3, 4 });
+		assertFieldNumbers(LabelDecision.getDescriptor(),
+				new String[] { "z_cluster", "label" }, new int[] { 1, 2 });
 		assertFieldNumbers(Arguments.getDescriptor(),
 				new String[] { "zingg_dir", "model_id", "job_id", "collect_metrics", "output", "data",
 						"training_samples", "field_definition", "num_partitions", "label_data_sample_size",
@@ -53,6 +56,23 @@ class ZinggCommandSchemaTest {
 		assertEquals("train", parsed.getPhase());
 		assertEquals("model-1", parsed.getArgs().getModelId());
 		assertTrue(parsed.getUnknownFields().asMap().containsKey(4));
+	}
+
+	@Test
+	void labelDecisionsRoundTripAsPartOfCommand() throws Exception {
+		ZinggCommand original = ZinggCommand.newBuilder()
+				.setPhase("label")
+				.addLabels(LabelDecision.newBuilder().setZCluster("cluster-1").setLabel(1))
+				.addLabels(LabelDecision.newBuilder().setZCluster("cluster-2").setLabel(0))
+				.build();
+
+		ZinggCommand parsed = ZinggCommand.parseFrom(original.toByteArray());
+
+		assertEquals(2, parsed.getLabelsCount());
+		assertEquals("cluster-1", parsed.getLabels(0).getZCluster());
+		assertEquals(1, parsed.getLabels(0).getLabel());
+		assertEquals("cluster-2", parsed.getLabels(1).getZCluster());
+		assertEquals(0, parsed.getLabels(1).getLabel());
 	}
 
 	private static void assertFieldNumbers(Descriptor descriptor, String[] names, int[] numbers) {

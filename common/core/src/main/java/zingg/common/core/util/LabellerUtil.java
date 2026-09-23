@@ -18,9 +18,15 @@ public class LabellerUtil<D, R, C> {
         //drop isMatch column from unMarked records
         //and replace with updated isMatch column
         cols.add(updatedLabelledRecords.col(ColName.MATCH_FLAG_COL));
-        ZFrame<D,R,C> zFieldsFromUpdatedLabelledRecords = updatedLabelledRecords.select(cols).
-                withColumnRenamed(ColName.ID_COL, ColName.COL_PREFIX + ColName.ID_COL).
-                withColumnRenamed(ColName.CLUSTER_COLUMN, ColName.COL_PREFIX + ColName.CLUSTER_COLUMN);
+        // Rename both join keys in the projection itself. Chained
+        // withColumnRenamed calls can be analyzed inconsistently by Spark
+        // Connect/Spark 3.5, leaving one of the expected prefixed columns
+        // unresolved at the subsequent join.
+        ZFrame<D,R,C> zFieldsFromUpdatedLabelledRecords = updatedLabelledRecords.select(cols)
+                .toDF(new String[] {
+                        ColName.COL_PREFIX + ColName.ID_COL,
+                        ColName.COL_PREFIX + ColName.CLUSTER_COLUMN,
+                        ColName.MATCH_FLAG_COL });
 
         unmarkedRecords = unmarkedRecords.drop(ColName.MATCH_FLAG_COL);
 

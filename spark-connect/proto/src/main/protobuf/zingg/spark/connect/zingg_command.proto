@@ -86,6 +86,14 @@ message ClientOptions {
   // next available field number: 7
 }
 
+// A client-collected label decision. The client owns only the presentation and
+// collection of the decision; Java applies it to the training data.
+message LabelDecision {
+  string z_cluster = 1;
+  int32 label = 2; // 1=match, 0=not a match, 2=not sure
+  // next available field number: 3
+}
+
 // One ZinggCommand per phase invocation (train/match/label/...). Packed into
 // spark.connect.Command.extension (google.protobuf.Any) by the zingg_connect
 // python client and unpacked by ZinggCommandPlugin on the server.
@@ -96,11 +104,12 @@ message ClientOptions {
 // That is sufficient for phases that only need success/failure (train,
 // match, trainMatch, link, findTrainingData, generateDocs, recommend,
 // updateLabel). Phases that need to return row data to the client (the
-// interactive label/findAndLabel loop) cannot be modeled as a CommandPlugin
-// and need a RelationPlugin instead -- not yet implemented here.
+// interactive label/findAndLabel loop) use a RelationPlugin for the fetch;
+// the subsequent label submission is modeled as a CommandPlugin invocation.
 message ZinggCommand {
   string phase = 1; // matches zingg.common.client.options.ZinggOptions value, e.g. "train","match","label",...
   Arguments args = 2;
   ClientOptions options = 3;
-  // next available field number: 4
+  repeated LabelDecision labels = 4;
+  // next available field number: 5
 }
