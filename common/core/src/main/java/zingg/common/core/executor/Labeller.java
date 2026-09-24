@@ -1,7 +1,10 @@
 package zingg.common.core.executor;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Scanner;
+import java.util.Set;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -13,6 +16,7 @@ import zingg.common.client.ZinggClientException;
 import zingg.common.client.cols.ZidAndFieldDefSelector;
 import zingg.common.client.options.ZinggOptions;
 import zingg.common.client.util.ColName;
+import zingg.common.client.util.ColValues;
 import zingg.common.client.util.DFObjectUtil;
 import zingg.common.core.preprocess.IPreprocessors;
 import zingg.common.core.util.LabellerUtil;
@@ -48,6 +52,88 @@ public abstract class Labeller<S,D,R,C,T> extends ZinggBase<S,D,R,C,T> implement
 		} catch (Exception e) {
 			throw new ZinggClientException("Error in labelling phase ", e);
 		}
+	}
+
+	/**
+	 * Applies externally collected labels using the same Java-side data path as
+	 * the interactive labeller. The caller supplies one decision per cluster;
+	 * this method owns validation, selection of the unmarked pair, label-column
+	 * update, post-processing, and persistence.
+	 *
+	 * <p>This is intentionally separate from {@link #execute()}, which is the
+	 * stdin-driven CLI flow. It is used by remote APIs such as Spark Connect,
+	 * where the client displays the pair and sends the decision back.</p>
+	 *
+	 * @param labels map of z_cluster to 1 (match), 0 (not a match), or 2 (not sure)
+	 * @return number of cluster decisions applied
+	 * @throws ZinggClientException if a label is invalid or its cluster is not
+	 *         currently unmarked
+	 */
+	public int applyLabels(Map<String, Integer> labels) throws ZinggClientException {
+		if (labels == null || labels.isEmpty()) {
+			return 0;
+		}
+
+		getTrainingDataModel().setMarkedRecordsStat(getMarkedRecords());
+		ZFrame<D, R, C> unmarkedRecords = getUnmarkedRecords();
+		if (unmarkedRecords == null) {
+			throw new ZinggClientException("No unmarked training pairs found for labeling.");
+		}
+
+		ZFrame<D, R, C> preprocessedUnmarkedRecords = preprocess(unmarkedRecords);
+		ZFrame<D, R, C> updatedRecords = applyLabelDecisions(preprocessedUnmarkedRecords, labels);
+		LabellerUtil<D, R, C> labellerUtil = new LabellerUtil<D, R, C>();
+		ZFrame<D, R, C> postProcessed = labellerUtil.postProcessLabel(updatedRecords, unmarkedRecords);
+		getTrainingDataModel().writeLabelledOutput(postProcessed, args);
+		return labels.size();
+	}
+
+	/**
+	 * Applies externally supplied decisions to a labelling frame. The frame may
+	 * be preprocessed for display/selection, while the caller remains
+	 * responsible for post-processing it against the original input frame.
+	 */
+	protected ZFrame<D, R, C> applyLabelDecisions(ZFrame<D, R, C> lines,
+			Map<String, Integer> labels) throws ZinggClientException {
+		if (lines == null || lines.isEmpty()) {
+			throw new ZinggClientException("No unmarked training pairs found for labeling.");
+		}
+
+		ZFrame<D, R, C> updatedRecords = null;
+		Set<String> seenClusters = new HashSet<String>();
+		for (Map.Entry<String, Integer> entry : labels.entrySet()) {
+			String cluster = entry.getKey();
+			Integer label = entry.getValue();
+			if (cluster == null || cluster.isEmpty()) {
+				throw new ZinggClientException("A label decision is missing its z_cluster.");
+			}
+			if (label == null || (label != ColValues.MATCH_TYPE_NOT_A_MATCH
+					&& label != ColValues.MATCH_TYPE_MATCH
+					&& label != ColValues.MATCH_TYPE_NOT_SURE)) {
+				throw new ZinggClientException("Invalid label '" + label + "' for cluster '" + cluster
+						+ "'. Expected 0, 1, or 2.");
+			}
+			if (!seenClusters.add(cluster)) {
+				throw new ZinggClientException("Duplicate label decision for cluster '" + cluster + "'.");
+			}
+
+			ZFrame<D, R, C> currentPair = lines.filter(
+					lines.equalTo(ColName.CLUSTER_COLUMN, cluster));
+			if (currentPair == null || currentPair.isEmpty()) {
+				throw new ZinggClientException("Cluster '" + cluster
+						+ "' is not present in the current unmarked training pairs.");
+			}
+
+			updatedRecords = updateLabelledRecords(label, currentPair, updatedRecords);
+		}
+		return updatedRecords;
+	}
+
+	protected ZFrame<D, R, C> updateLabelledRecords(int label, ZFrame<D, R, C> currentPair,
+			ZFrame<D, R, C> updatedRecords) {
+		ZFrame<D, R, C> result = getTrainingDataModel().updateRecords(label, currentPair, updatedRecords);
+		getTrainingDataModel().updateLabellerStat(label, INCREMENT);
+		return result;
 	}
 
 	
@@ -116,18 +202,17 @@ public abstract class Labeller<S,D,R,C,T> extends ZinggBase<S,D,R,C,T> implement
 
 //					selectedOption = displayRecordsAndGetUserInput(getDSUtil().select(currentPair, displayCols), msg1, msg2);
 					selectedOption = displayRecordsAndGetUserInput(currentPair.select(zidAndFieldDefSelector.getCols()), msg1, msg2);
-					getTrainingDataModel().updateLabellerStat(selectedOption, INCREMENT);
+					if (selectedOption == QUIT_LABELING) {
+						LOG.info("User has quit in the middle. Updating the records.");
+						break;
+					}
+					updatedRecords = updateLabelledRecords(selectedOption, currentPair, updatedRecords);
 					getLabelDataViewHelper().printMarkedRecordsStat(
 							getTrainingDataModel().getPositivePairsCount(),
 							getTrainingDataModel().getNegativePairsCount(),
 							getTrainingDataModel().getNotSurePairsCount(),
 							getTrainingDataModel().getTotalCount()
 							);
-					if (selectedOption == QUIT_LABELING) {
-						LOG.info("User has quit in the middle. Updating the records.");
-						break;
-					}
-					updatedRecords = getTrainingDataModel().updateRecords(selectedOption, currentPair, updatedRecords);
 				}
 				LOG.warn("Processing finished.");
 				return updatedRecords;

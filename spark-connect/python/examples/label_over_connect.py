@@ -3,7 +3,7 @@ Interactive labelling over Spark Connect (py4j-free), end to end:
 
   1. fetch the unmarked training pairs from the server   (Zingg.getUnmarkedPairs)
   2. mark each pair on the client                        (this script's CLI prompt)
-  3. write the labels back to the server                 (Zingg.writeMarkedPairs)
+  3. submit the labels to the Java labeller on the server (Zingg.submitLabels)
 
 Steps 1 and 3 are library calls; only the marking UI lives here, since that is
 application specific (CLI here, but could be a notebook or web form).
@@ -88,8 +88,8 @@ def main():
     print(f"Marked: {counts[MATCH]} match, {counts[NO_MATCH]} no-match, {counts[NOT_SURE]} not-sure")
 
     # 3) write labels back
-    n = zingg.writeMarkedPairs(labels)
-    print(f"Wrote {n} marked pairs back to the server -- run train next.")
+    zingg.submitLabels(labels)
+    print(f"Submitted {len(labels)} label decisions to the Java labeller -- run train next.")
 
 
 if __name__ == "__main__":

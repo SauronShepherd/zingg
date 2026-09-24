@@ -73,58 +73,14 @@ def execute_zingg_command(remote, zingg_command):
         ) from e
 
 
-def _resolve_session(remote):
-    """Return a pyspark.sql.connect SparkSession for `remote` (a connection
-    string like "sc://localhost:15002" or an existing connect SparkSession)."""
-    from pyspark.sql.connect.session import SparkSession
+def submit_zingg_labels(remote, zingg_command):
+    """Submit client-collected label decisions to the Java SparkLabeller.
 
-    if isinstance(remote, SparkSession):
-        return remote
-    if isinstance(remote, str):
-        return SparkSession.builder.remote(remote).getOrCreate()
-    raise TypeError(
-        "remote must be a Spark Connect connection string or a "
-        "pyspark.sql.connect.session.SparkSession to write marked pairs; got "
-        f"{type(remote)!r}"
-    )
-
-
-def write_marked_pairs(remote, unmarked_path, marked_path, labels):
-    """Write labelled pairs back to the model's marked training folder.
-
-    The label decisions are made on the client, but the pair rows stay on the
-    server -- so we read the unmarked pairs there (keeping their exact schema),
-    attach the client's labels by cluster id, overwrite z_isMatch, and append
-    to the marked folder. Plain Spark Connect DataFrame ops, no extra server
-    plugin needed. train() then picks the marked pairs up as usual.
-
-    :param remote: see _resolve_session
-    :param unmarked_path: server path of the unmarked training pairs
-    :param marked_path: server path to append the marked pairs to
-    :param labels: iterable of (z_cluster, label) where label is 1/0/2
-    :returns: number of pairs written
+    Python only carries the decisions over the Spark Connect command channel.
+    Java owns validation, pair selection, schema handling, post-processing, and
+    persistence of the marked training data.
     """
-    from pyspark.sql.connect.functions import col
-
-    labels = list(labels)
-    if not labels:
-        return 0
-
-    spark = _resolve_session(remote)
-    try:
-        unmarked = spark.read.parquet(unmarked_path)
-        original_cols = unmarked.columns
-        labels_df = spark.createDataFrame(labels, "z_cluster string, _newlabel int")
-        marked = (unmarked.drop("z_isMatch")
-                  .join(labels_df, "z_cluster")
-                  .withColumnRenamed("_newlabel", "z_isMatch"))
-        # restore original column order; keep z_isMatch as int
-        marked = marked.select([col(c).cast("int").alias(c) if c == "z_isMatch" else col(c)
-                                for c in original_cols])
-        marked.write.mode("append").parquet(marked_path)
-    except Exception as e:
-        raise ZinggConnectError(f"Failed to write marked pairs over Spark Connect: {e}") from e
-    return len(labels)
+    execute_zingg_command(remote, zingg_command)
 
 
 def fetch_zingg_relation(remote, zingg_command):

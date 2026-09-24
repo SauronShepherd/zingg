@@ -3,6 +3,9 @@ package zingg.spark.connect.server;
 import com.google.protobuf.Any;
 import com.google.protobuf.InvalidProtocolBufferException;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.spark.sql.SparkSession;
@@ -18,17 +21,17 @@ import zingg.common.client.arguments.model.IZArgs;
 import zingg.common.client.options.ZinggOption;
 import zingg.common.client.options.ZinggOptions;
 import zingg.spark.client.SparkClient;
+import zingg.spark.core.executor.SparkLabeller;
 import zingg.spark.connect.proto.ZinggCommand;
 
 /**
  * Spark Connect CommandPlugin that dispatches a ZinggCommand (packed as the
  * Any extension on spark.connect.Command) into the existing, unmodified
- * IZingg/ZinggOptions/SparkZFactory execution path -- this class adds no new
- * matching/training logic of its own, it only bridges the Connect wire
- * protocol to zingg.spark.client.SparkClient exactly as SparkClient.main /
- * the py4j Zingg python wrapper already do.
+ * IZingg/ZinggOptions/SparkZFactory execution path. For label submissions it
+ * calls the existing Java SparkLabeller API so label semantics and persistence
+ * remain on the server; Python only transports the decisions.
  *
- * Registration (server side, not wired into any build yet):
+ * Registration (server side):
  *   --conf spark.connect.extensions.command.classes=zingg.spark.connect.server.ZinggCommandPlugin
  *
  * Limitation: CommandPlugin#process only signals handled/not-handled -- there
@@ -37,8 +40,8 @@ import zingg.spark.connect.proto.ZinggCommand;
  * the RPC with no result rows. That is sufficient for fire-and-execute phases
  * (train, match, trainMatch, link, findTrainingData, generateDocs, recommend,
  * updateLabel) but NOT for phases that must return row data to the caller
- * (the interactive label/findAndLabel loop) -- those need a RelationPlugin
- * instead, which is not implemented in this module yet.
+ * (the interactive label/findAndLabel loop) -- those use the RelationPlugin;
+ * label submission itself uses this command path.
  */
 public class ZinggCommandPlugin implements CommandPlugin {
 
@@ -101,6 +104,10 @@ public class ZinggCommandPlugin implements CommandPlugin {
 		String phase = zinggCommand.getPhase();
 		ZinggOptions.verifyPhase(phase);
 		ZinggOption zinggOption = ZinggOptions.getByValue(phase);
+		if (zinggOption.equals(ZinggOptions.LABEL) && zinggCommand.getLabelsCount() > 0) {
+			applyLabels(zinggCommand, session);
+			return;
+		}
 		if (zinggOption.equals(ZinggOptions.LABEL) || zinggOption.equals(ZinggOptions.FIND_AND_LABEL)) {
 			throw new ZinggClientException(
 					"Phase '" + phase + "' returns row data to the caller and is not yet supported over "
@@ -118,5 +125,23 @@ public class ZinggCommandPlugin implements CommandPlugin {
 		// the long-running server and shared across requests, so stopping it would
 		// tear down Spark for every subsequent phase. (The CLI's init/execute/stop
 		// pattern only fits a one-Spark-per-process run.)
+	}
+
+	private void applyLabels(ZinggCommand zinggCommand, SparkSession session) throws ZinggClientException {
+		Map<String, Integer> labels = new LinkedHashMap<String, Integer>();
+		for (zingg.spark.connect.proto.LabelDecision decision : zinggCommand.getLabelsList()) {
+			String cluster = decision.getZCluster();
+			if (labels.put(cluster, decision.getLabel()) != null) {
+				throw new ZinggClientException("Duplicate label decision for cluster '" + cluster + "'.");
+			}
+		}
+
+		IZArgs args = ZinggProtoConverters.toJavaArguments(zinggCommand.getArgs());
+		ClientOptions options = ZinggProtoConverters.toJavaClientOptions(zinggCommand.getPhase(),
+				zinggCommand.getOptions());
+		LOG.info("Applying " + labels.size() + " label decisions via the Java SparkLabeller");
+		SparkLabeller labeller = new SparkLabeller();
+		labeller.init(args, session, options);
+		labeller.applyLabels(labels);
 	}
 }
